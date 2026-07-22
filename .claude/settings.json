@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./tools/bin/tmake *)",
+      "Bash(tools/bin/tmake *)",
+      "Bash(make *)",
+      "Bash(git status*)",
+      "Bash(git log *)",
+      "Bash(git diff*)",
+      "Bash(git show *)",
+      "Bash(git branch*)",
+      "Bash(git blame *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git checkout *)",
+      "Bash(git switch *)",
+      "Bash(git restore *)",
+      "Bash(git stash*)",
+      "Bash(git fetch*)",
+      "Bash(git pull*)",
+      "Bash(git cherry-pick *)",
+      "Bash(git merge-base *)",
+      "Bash(git rev-parse *)",
+      "Bash(git rev-list *)",
+      "Bash(git check-ignore *)",
+      "Bash(grep *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(diff *)",
+      "Bash(syn/scripts/syn_launch.sh *)",
+      "Bash(./scripts/syn_launch.sh *)",
+      "Bash(dc_shell *)"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Read(./.env*)",
+      "Read(./**/secrets/**)"
+    ],
+    "ask": [
+      "Bash(git push*)"
+    ]
+  }
+}

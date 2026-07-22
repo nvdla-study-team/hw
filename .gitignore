@@ -10,3 +10,8 @@ vmod/dw_components/
 outdir/
 .nvprojectname
 tree.make
+
+# Claude Code harness 本地文件
+.claude/settings.local.json
+CLAUDE.local.md
+.claude/loop/logs/
