@@ -8,6 +8,27 @@
 
 // File Name: NV_NVDLA_CDP_reg.v
 
+// ----------------------------------------------------------------
+// 【机制总览】CDP 寄存器组：single + d0/d1 乒乓（ping-pong）配置
+//
+// 目的：软件在硬件执行第 N 层的同时预配置第 N+1 层，消除逐层配置空窗。
+// 同一 4KB 地址块（0xf000）按块内偏移一分为二：
+//   - 偏移 < 0x048：single 组（唯一一份）——producer/consumer 指针、
+//     两组 status、LUT 访问窗口与 LUT 参数等跨乒乓共享的寄存器；
+//   - 偏移 >= 0x048：dual 组，d0/d1 两份完整的单层配置。
+//
+// 两个指针（同在 single 组 S_POINTER 寄存器）分工严格：
+//   - producer（软件写）：决定 CSB 对 dual 组的「读和写」落到 d0 还是
+//     d1（见下方 select_d0/d1 与读回 mux）；
+//   - consumer（硬件维护，软件只读）：决定数据通路取哪组参数（文末
+//     大段 mux）、done 时清哪组 op_en、中断上报的组号；每层做完
+//     （dp2reg_done 脉冲）翻转一次。CSB 访问选组与 consumer 无关。
+//
+// 软件节拍：查 status 确认目标组空闲 → 设 producer → 写整组配置 →
+// 写 OP_EN=1 武装；硬件按 consumer 顺序轮流消费两组、自动清 op_en。
+// op_en=1 期间该组被锁写（写使能被屏蔽 + 断言报错），防止改写正在
+// 执行的配置。
+// ----------------------------------------------------------------
 `include "simulate_x_tick.vh"
 module NV_NVDLA_CDP_reg (
    nvdla_core_clk                  //|< i
@@ -303,6 +324,9 @@ reg     [3:0] slcg_op_en_d2;
 reg     [3:0] slcg_op_en_d3;
 
 
+// single 组例化：承载 producer/consumer 指针、两组 status、LUT 访问窗口
+// 与 LUT 参数等共享寄存器；consumer/status/lut_addr 等只读字段由本模块
+// 维护后反灌给它用于读回
 //Instance single register group
 NV_NVDLA_CDP_REG_single u_single_reg (
    .reg_rd_data              (s_reg_rd_data[31:0])                   //|> w
@@ -346,6 +370,8 @@ NV_NVDLA_CDP_REG_single u_single_reg (
   ,.status_1                 (dp2reg_status_1[1:0])                  //|< r
   );
 
+// d0/d1 双组例化：同一 REG_dual 模块两份实例，各存一层完整配置；
+// 写使能由 select_d0/d1（producer 决定）二选一，组内不感知乒乓
 //Instance two duplicated register groups
 
 NV_NVDLA_CDP_REG_dual u_dual_reg_d0 (
@@ -428,6 +454,8 @@ NV_NVDLA_CDP_REG_dual u_dual_reg_d1 (
   ,.perf_write_stall         (dp2reg_d1_perf_write_stall[31:0])      //|< i
   );
         
+// consumer 指针翻转（乒乓的心跳）：dp2reg_done 每来一拍翻转一次，
+// 指向下一组待执行配置；软件经 S_POINTER 只读观察
 ////////////////////////////////////////////////////////////////////////
 //                                                                    //
 // GENERATE CONSUMER PIONTER IN GENERAL SINGLE REGISTER GROUP         //
@@ -501,6 +529,9 @@ end
 // GENERATE TWO STATUS FIELDS IN GENERAL SINGLE REGISTER GROUP        //
 //                                                                    //
 ////////////////////////////////////////////////////////////////////////
+// 组状态编码（软件轮询）：0=IDLE（未武装）、1=RUNNING（consumer 正指
+// 本组）、2=PENDING（已武装、等 consumer 轮到）；status_0/1 对
+// consumer 的判断极性相反
 always @(
   reg2dp_d0_op_en
   or dp2reg_consumer
@@ -524,6 +555,9 @@ end
 // GENERATE OP_EN LOGIC                                               //
 //                                                                    //
 ////////////////////////////////////////////////////////////////////////
+// op_en（组武装标志）×2：写 D_OP_ENABLE 触发置位（仅未武装时接受写值）；
+// 本组执行完（done 且 consumer 正指本组）硬件自动清零，软件无需手动关。
+// 注意与 consumer 翻转（上方）是两件事：翻转负责换组，这里清本组武装位
 always @(
   reg2dp_d0_op_en
   or reg2dp_d0_op_en_trigger
@@ -562,6 +596,9 @@ always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   end
 end
 
+// 当前生效 op_en：按 consumer 选组，再经 3 级移位输出 reg2dp_op_en——
+// 与同为 3 拍延迟的 slcg_op_en 配合，保证门控时钟先于运行使能到达
+// 数据通路；done 当拍移位链清零，运行使能立即撤销
 always @(
   dp2reg_consumer
   or reg2dp_d1_op_en
@@ -618,6 +655,10 @@ assign slcg_op_en = slcg_op_en_d3;
 // GENERATE ACCESS LOGIC TO EACH REGISTER GROUP                       //
 //                                                                    //
 ////////////////////////////////////////////////////////////////////////
+// 0x048 分界译码（乒乓的地址面）：块内偏移 < 0x048 → single 组；
+// >= 0x048 → dual 组，由 producer 指针决定 d0 还是 d1（读写同规则）。
+// d0/d1 写使能再与 ~op_en 相与：已武装的组锁写，违规写被丢弃并由
+// 下方断言在仿真中报错
 //EACH subunit has 4KB address space
 assign select_s  = (reg_offset[11:0] < (32'hf048  & 32'hfff)) ? 1'b1: 1'b0;
 assign select_d0 = (reg_offset[11:0] >= (32'hf048  & 32'hfff)) & (reg2dp_producer == 1'h0 );
@@ -635,6 +676,8 @@ assign s_reg_wr_data  = reg_wr_data;
 assign d0_reg_wr_data = reg_wr_data;
 assign d1_reg_wr_data = reg_wr_data;
 
+// 读回 mux：single/d0/d1 三选一按位或（select 互斥）；dual 组读到的是
+// producer 所指那组——软件读的是自己正在配置的那份，与 consumer 无关
 assign reg_rd_data = ({32{select_s}}  & s_reg_rd_data)  |
                      ({32{select_d0}} & d0_reg_rd_data) |
                      ({32{select_d1}} & d1_reg_rd_data);
@@ -734,6 +777,8 @@ assign reg_rd_data = ({32{select_s}}  & s_reg_rd_data)  |
 // spyglass enable_block WRN_61 
 `endif // SPYGLASS_ASSERT_ON
 
+// CSB 接入通路：请求寄存一拍（prdy 恒 1 不反压）→ 当拍完成读/写 →
+// 再寄存一拍回响应；寄存器访问固定两拍，无等待状态
 ////////////////////////////////////////////////////////////////////////
 //                                                                    //
 // GENERATE CSB TO REGISTER CONNECTION LOGIC                          //
@@ -810,6 +855,8 @@ end
 `endif // SPYGLASS_ASSERT_ON
 
 
+// 62bit 请求拆包：addr[21:0] 字地址（高 6 位在此包格式中恒 0）、wdat、
+// write、nposted；srcpriv/wrbe/level 是包格式预留字段，本设计未用
 // PKT_UNPACK_WIRE( csb2xx_16m_be_lvl ,  req_ ,  req_pd )
 assign        req_addr[21:0] =     req_pd[21:0];
 assign        req_wdat[31:0] =     req_pd[53:22];
@@ -822,6 +869,7 @@ assign        req_level[1:0] =     req_pd[62:61];
 assign csb2cdp_req_prdy = 1'b1;
 
 
+// 字地址左移 2 还原字节偏移；组译码只看块内偏移 [11:0]
 //Address in CSB master is word aligned while address in regfile is byte aligned.
 assign reg_offset = {req_addr, 2'b0};
 assign reg_wr_data = req_wdat;
@@ -829,6 +877,8 @@ assign reg_wr_en = req_pvld & req_write;
 assign reg_rd_en = req_pvld & ~req_write;
 
 
+// 响应打包：type[33] 区分读(0)/写完成(1)；error 恒 0——寄存器空间内
+// 不产生访问错误，未映射偏移读回 0（读 mux 无命中即全 0）
 // PKT_PACK_WIRE_ID( nvdla_xx2csb_resp ,  dla_xx2csb_rd_erpt ,  csb_rresp_ ,  csb_rresp_pd_w )
 assign       csb_rresp_pd_w[31:0] =     csb_rresp_rdat[31:0];
 assign       csb_rresp_pd_w[32] =     csb_rresp_error ;
@@ -846,6 +896,7 @@ assign csb_rresp_error = 1'b0;
 assign csb_wresp_rdat = {32{1'b0}};
 assign csb_wresp_error = 1'b0;
 
+// 回响应：读、或 non-posted 写才回；posted 写静默（与 CSB 协议一致）
 always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   if (!nvdla_core_rstn) begin
     cdp2csb_resp_pd <= {34{1'b0}};
@@ -869,6 +920,8 @@ always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   end
 end
 
+// 数据通路取用配置：以下整段 mux 全按 consumer 指针选组——硬件永远用
+// "轮到执行"的那组，与软件正经 producer 写的另一组互不干扰
 ////////////////////////////////////////////////////////////////////////
 //                                                                    //
 // GENERATE OUTPUT REGISTER FILED FROM DUPLICATED REGISTER GROUPS     //
@@ -1031,7 +1084,9 @@ end
 // PASTE ADDIFITON LOGIC HERE FROM EXTRA FILE                         //
 //                                                                    //
 ////////////////////////////////////////////////////////////////////////
+// LUT 写数据直通自 CSB 写总线：配合 lut_data_trigger 脉冲逐项写入
 assign reg2dp_lut_data = reg_wr_data[15:0];
+// 中断组号 = consumer：标记本次 done/中断属于哪组，软件据此收尾对应层
 assign reg2dp_interrupt_ptr = dp2reg_consumer;
 //lut_addr generate logic
 //   .reg_rd_data             (s_reg_rd_data[31:0])                    //|> w
@@ -1050,6 +1105,8 @@ assign reg2dp_lut_data_wr_trigger = (reg_offset_wr == (32'h1000c  & 32'h00000fff
 //assign reg2dp_lut_data_rd_trigger = (reg_offset_wr == (NVDLA_CDP_S_LUT_ACCESS_DATA_0 & 32'h00000fff)) & (!s_reg_wr_en) & (reg2dp_lut_access_type == NVDLA_CDP_S_LUT_ACCESS_CFG_0_LUT_ACCESS_TYPE_READ); //spyglass disable UnloadedNet-ML //(W528)
 assign reg2dp_lut_data_rd_trigger = (reg_offset_wr == (32'hf00c  & 32'h00000fff)) & (reg_rd_en & select_s) & (reg2dp_lut_access_type == 1'h0 ); //spyglass disable UnloadedNet-ML //(W528)
 
+// LUT 地址自增：写 ACCESS_CFG 装初值；此后每次读/写 ACCESS_DATA 地址
+// 自动 +1，软件可连续搬整张表；到表尾饱和（上界由 table_id 选 64/256）
 assign lut_end = (dp2reg_lut_addr == ((reg2dp_lut_table_id)? 10'd256 : 10'd64));
 always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   if (!nvdla_core_rstn) begin
@@ -1068,6 +1125,8 @@ end
 assign reg2dp_lut_addr[9:0] = dp2reg_lut_addr[9:0];
 
 
+// op_en 沿检测：set=完成沿（op_en 1→0）、clr=启动沿（0→1）、reg=任一沿；
+// 供下方统计影子寄存器做"启动清零、完成快照"
 //////// for general counting register ////////
 always @(
   reg2dp_d0_op_en
@@ -1087,6 +1146,8 @@ always @(
     dp2reg_d1_reg = reg2dp_d1_op_en ^ reg2dp_d1_op_en_w;
 end
 
+// NaN/Inf 统计影子寄存器：启动沿清零、完成沿把数据通路实时计数快照进
+// 本组——软件读到的永远是已完成那层的定格值，不受后续层运行干扰
 //////// for NaN and infinity counting registers ////////
 //////// group 0 ////////
 always @(
@@ -1306,6 +1367,7 @@ end
 // spyglass enable_block WRN_61 
 `endif // SPYGLASS_ASSERT_ON
 
+// group 1 与 group 0 同构，挂在 d1 的 op_en 沿上
 //////// group 1 ////////
 always @(
   dp2reg_d1_set

@@ -302,6 +302,13 @@ assign dma_rd_rsp_pd = ({514{mc_dma_rd_rsp_vld}} & mc_dma_rd_rsp_pd)
 // spyglass enable_block WRN_61 
 `endif // SPYGLASS_ASSERT_ON
 
+// ---------------- 读 credit 归还（流控闭环） ----------------
+// 机制：mcif/cvif 按 credit 管控每个客户端可占用的读返回缓冲量。
+// 本客户端每从自家 latency FIFO 消费掉一拍读响应（dma_rd_cdt_lat_fifo_pop，
+// 定义见下方 = lat_rd_pvld & lat_rd_prdy），就寄存一拍向对应接口打一个
+// pop 脉冲，表示"腾出一拍缓冲"，接口侧据此放行后续返回数据。
+// 按 dma_rd_rsp_type（= src_ram_type：1=MC / 0=CV）分流两路；一层只用
+// 一种 ram_type，两路脉冲不会同拍有效
 always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   if (!nvdla_core_rstn) begin
     cdp2mcif_rd_cdt_lat_fifo_pop <= 1'b0;
@@ -340,6 +347,8 @@ assign       lat_rd_data[511:0] =    lat_rd_pd[511:0];
 assign       lat_rd_mask[1:0] =    lat_rd_pd[513:512];
 // lat_rd_mask | lat_rd_data
 
+// credit 归还脉冲源头：latency FIFO 出口真正被取走一拍才算消费——
+// 被下游 reorder FIFO 反压时不 pop、不归还
 assign dma_rd_cdt_lat_fifo_pop = lat_rd_pvld & lat_rd_prdy;
 
 // only care the rdy of ro-fifo which mask bit indidates

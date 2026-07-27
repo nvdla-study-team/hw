@@ -8,6 +8,34 @@
 
 // File Name: NV_NVDLA_csb_master.v
 
+// ----------------------------------------------------------------
+// 【机制总览】CSB 主控：falcon 单口配置总线 → 17 路目的地扇出
+//
+// 数据流（与本文件代码顺序一致）：
+//   1) falcon 域捕获打包：csb2nvdla 单口请求打成 50bit
+//      csb2nvdla_pd = {nposted, write, wdat[31:0], addr[15:0]}，
+//      写入 falcon2csb 异步 FIFO（4 深）跨到 core 域；
+//   2) core 域两级寄存：FIFO 出口恒 ready（core_req_prdy=1，见下），
+//      弹出后经共享的 core_req_pd_d1 寄存一拍，再进各路输出寄存器
+//      （csb2xx_req_pd_tmp）——两级换取 17 路扇出的时序裕量；
+//   3) 地址译码：byte_addr = {addr, 2'b0}，掩码 18'h3F000，即按
+//      byte_addr[17:12]（4KB 块号）与 17 个基址一一比较；全不中落
+//      dummy 兜底路；afbif 路在 nv_full 恒关（select_afbif=0）；
+//   4) 请求重打包：csb2xx_req_pd[62:0] =
+//      {7'h0, nposted[55], write[54], wdat[53:22], 6'h0, addr[15:0]}，
+//      [21:16]/[62:56] 为保留位恒 0；
+//   5) 响应汇聚：17 路单元响应各寄存一拍，连同 dummy 与恒 0 的 afbif
+//      共 19 枝做 OR-mux，合成 core_resp_pd[33:0] =
+//      {type[33]（0 读 / 1 写完成）, error[32], rdat[31:0]}；
+//   6) 回程 CDC：经 csb2falcon 异步 FIFO（2 深）回 falcon 域，按 type
+//      拆成 nvdla2csb_valid/data（读）与 nvdla2csb_wr_complete（写完成）；
+//      error 位在 falcon 出口没有信号可挂，被丢弃。
+//
+// 流控要点：各路对下游 prdy 反压是"就地保持"（每路两级寄存兜一笔），
+// 但对上游请求 FIFO 恒 ready、共享暂存又只有一份——正确性依赖 CSB
+// 使用约定：同一时刻只允许一笔在途请求（软件发下一笔前必须等到响应）。
+// 违反时响应 OR-mux 会混叠，由 zero_one_hot 断言在仿真中兜底报错。
+// ----------------------------------------------------------------
 `include "simulate_x_tick.vh"
 module NV_NVDLA_csb_master (
    nvdla_core_clk          //|< i
@@ -449,8 +477,12 @@ reg           select_sdp_rdma;
 ////////////////////////////////////////////////////////////////////////
 // Falcon interface to async FIFO                                     //
 ////////////////////////////////////////////////////////////////////////
+// falcon 域请求打包：{nposted, write, wdat[31:0], addr[15:0]} 共 50bit；
+// csb2nvdla_ready 直接取自 FIFO 写侧 wr_ready——FIFO 满时对 CPU/桥反压
 assign  csb2nvdla_pd[49:0] = {csb2nvdla_nposted,csb2nvdla_write,csb2nvdla_wdat,csb2nvdla_addr};
 
+// 请求方向 CDC：falcon → core 异步 FIFO（4 深，格雷计数 + 3 级同步器，
+// 机制详见 NV_NVDLA_CSB_MASTER_falcon2csb_fifo 文件头块注）
 NV_NVDLA_CSB_MASTER_falcon2csb_fifo u_fifo_csb2nvdla (
    .wr_clk        (nvdla_falcon_clk)        //|< i
   ,.wr_reset_     (nvdla_falcon_rstn)       //|< i
@@ -465,8 +497,12 @@ NV_NVDLA_CSB_MASTER_falcon2csb_fifo u_fifo_csb2nvdla (
   ,.pwrbus_ram_pd (pwrbus_ram_pd[31:0])     //|< i
   );
 
+// core 侧弹出恒 ready：请求一到即取走，本模块不向 falcon 侧反压请求流；
+// 下游拥塞的保护交给"单笔在途"软件约定（见文件头流控要点）
 assign  core_req_prdy = 1'b1;
 
+// 响应方向 CDC：core → falcon 异步 FIFO（2 深）；falcon 侧 rd_ready 拴 1，
+// 响应到达即被无条件取走
 NV_NVDLA_CSB_MASTER_csb2falcon_fifo u_fifo_nvdla2csb (
    .wr_clk        (nvdla_core_clk)          //|< i
   ,.wr_reset_     (nvdla_core_rstn)         //|< i
@@ -481,11 +517,15 @@ NV_NVDLA_CSB_MASTER_csb2falcon_fifo u_fifo_nvdla2csb (
   ,.pwrbus_ram_pd (pwrbus_ram_pd[31:0])     //|< i
   );
 
+// falcon 侧响应拆包：pd[33] 为 type——0 读响应（rdat 有效）、1 写完成；
+// error 位 pd[32] 在 falcon 出口没有对应信号，被静默丢弃
 //PKT_UNPACK_WIRE_VLD (nvdla_xx2csb_resp, dla_xx2csb_rd_erpt, nvdla2csb_rresp_, nvdla2csb_resp_pd, nvdla2csb_resp_pvld)
 //PKT_UNPACK_WIRE_VLD (nvdla_xx2csb_resp, dla_xx2csb_wr_erpt, nvdla2csb_wresp_, nvdla2csb_resp_pd, nvdla2csb_resp_pvld)
 assign       nvdla2csb_rresp_rdat[31:0] =  nvdla2csb_resp_pd[31:0];
 assign       nvdla2csb_rresp_is_valid = (nvdla2csb_resp_pvld  && (nvdla2csb_resp_pd[33:33] == 1'd0));
 assign       nvdla2csb_wresp_is_valid = (nvdla2csb_resp_pvld  && (nvdla2csb_resp_pd[33:33] == 1'd1));
+// 下方断言：响应 CDC FIFO 写侧永不堵（pvld 时必 prdy）——由 2 深 FIFO、
+// falcon 侧无条件取走、单笔在途约定三者共同保证
 
 `ifdef SPYGLASS_ASSERT_ON
 `else
@@ -535,6 +575,10 @@ assign       nvdla2csb_wresp_is_valid = (nvdla2csb_resp_pvld  && (nvdla2csb_resp
 // spyglass enable_block WRN_61 
 `endif // SPYGLASS_ASSERT_ON
 
+// falcon 侧出口寄存：读响应 → nvdla2csb_valid/data，写完成 →
+// nvdla2csb_wr_complete，valid 均为单拍脉冲；上游无 ready 可反压，
+// 接收方必须当拍取样。（下面被注释的 &Always 段是上游留下的 error/
+// 写回数据出口，本配置未引出）
 always @(posedge nvdla_falcon_clk or negedge nvdla_falcon_rstn) begin
   if (!nvdla_falcon_rstn) begin
     nvdla2csb_valid <= 1'b0;
@@ -588,6 +632,8 @@ end
 ////////////////////////////////////////////////////////////////////////
 // Distribute request and gather response                             //
 ////////////////////////////////////////////////////////////////////////
+// core 域请求拆包：从 50bit pd 还原 addr/write/nposted 供译码与 dummy 用；
+// wdat 不单独拆出——整个 pd 原样流向各路输出寄存器，62bit 打包时再重排
 //PKT_UNPACK_WIRE (csb2xx_request, core_req_, core_req_pd)
 //&Forget dangle core_req_srcpriv;
 //&Forget dangle core_req_wrbe;
@@ -597,6 +643,8 @@ assign        core_req_addr[15:0] = core_req_pd[15:0];
 assign        core_req_write      = core_req_pd[48];
 assign        core_req_nposted    = core_req_pd[49];
  
+// pop_valid：请求 FIFO 出口握手脉冲（prdy 恒 1，实际等价于 pvld），
+// 是各路 select 判定与请求捕获的统一触发点
 always @(
   core_req_pvld
   or core_req_prdy
@@ -604,9 +652,12 @@ always @(
     core_req_pop_valid = core_req_pvld & core_req_prdy;
 end
 
+// 还原字节地址用于译码：与 spec/地址映射表的字节偏移直接对照
 //core_req_addr is word aligned while address from arnvdla is byte aligned.
 assign core_byte_addr = {core_req_addr, 2'b0};
 
+// 弹出数据寄存一拍，17 路共享这唯一一份暂存：若某路输出被堵、pending
+// 未放行，此时又弹出新请求会覆盖旧数据——正确性再次依赖"单笔在途"约定
 always @(posedge nvdla_core_clk) begin
   if ((core_req_pvld & core_req_prdy) == 1'b1) begin
     core_req_pd_d1 <= core_req_pd;
@@ -618,9 +669,13 @@ always @(posedge nvdla_core_clk) begin
   end
 end
 
+// 译码掩码：展开为 18'h3F000，只比较 byte_addr[17:12]（4KB 块号）；
+// 块内偏移 [11:0] 透传，由目的地单元自行做寄存器级译码
 assign addr_mask = {{16 -10{1'b1}},{12{1'b0}}};
 //assign afbif_addr_mask = {{PKT_csb2xx_request_addr_WIDTH-11{1'b1}},{13{1'b0}}};
 
+// afbif 路在 nv_full 配置恒关：select 拴 0；其 FIFO 例化以注释形式保留
+// 在文件尾部（"CSB master to AFBIF interface" 段）备查
 //&Always;
 assign    select_afbif = 1'b0; //((core_byte_addr & afbif_addr_mask) == 0);
 //&End;
@@ -635,6 +690,11 @@ assign    select_afbif = 1'b0; //((core_byte_addr & afbif_addr_mask) == 0);
 assign core2afbif_req_pd = core_req_pd_d1;
 */
 
+// ---------------- 17 路目的地扇出（同构模板 × 17） ----------------
+// 每路同一套结构：select 译码 → 一级 pending 标志（xx_req_pvld）→
+// 二级输出寄存器（csb2xx_req_pvld / pd_tmp，直面下游 prdy 反压）→
+// 62bit 重打包。机制详注统一写在 glb 路（0x0000）作样板，其余各路仅标地址。
+// ---- cmac_a 路（0x7000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -700,6 +760,7 @@ end
 assign csb2cmac_a_req_pd ={7'h0,csb2cmac_a_req_pd_tmp[49:16],6'h0,csb2cmac_a_req_pd_tmp[15:0]};
 
 
+// ---- sdp_rdma 路（0xa000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -765,6 +826,7 @@ end
 assign csb2sdp_rdma_req_pd ={7'h0,csb2sdp_rdma_req_pd_tmp[49:16],6'h0,csb2sdp_rdma_req_pd_tmp[15:0]};
 
 
+// ---- csc 路（0x6000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -830,6 +892,7 @@ end
 assign csb2csc_req_pd ={7'h0,csb2csc_req_pd_tmp[49:16],6'h0,csb2csc_req_pd_tmp[15:0]};
 
 
+// ---- gec 路（0x1000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -895,6 +958,7 @@ end
 assign csb2gec_req_pd ={7'h0,csb2gec_req_pd_tmp[49:16],6'h0,csb2gec_req_pd_tmp[15:0]};
 
 
+// ---- cdp 路（0xf000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -960,6 +1024,7 @@ end
 assign csb2cdp_req_pd ={7'h0,csb2cdp_req_pd_tmp[49:16],6'h0,csb2cdp_req_pd_tmp[15:0]};
 
 
+// ---- cacc 路（0x9000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -1025,6 +1090,8 @@ end
 assign csb2cacc_req_pd ={7'h0,csb2cacc_req_pd_tmp[49:16],6'h0,csb2cacc_req_pd_tmp[15:0]};
 
 
+// ======== glb 路（0x0000）——详注样板，其余 16 路与此完全同构 ========
+// [1] 地址命中：块号比较（byte_addr[17:12] == 0）
 always @(
   core_byte_addr
   or addr_mask
@@ -1032,6 +1099,8 @@ always @(
     select_glb = ((core_byte_addr & addr_mask) == 32'h00000000);
 end
 
+// [2] 一级 pending 标志：本路命中即置 1；输出级空闲或即将被下游收走
+//     （prdy | ~pvld）时放行清 0；输出级堵着则保持——每路自带 1 深暂存
 always @(
   core_req_pop_valid
   or select_glb
@@ -1044,6 +1113,8 @@ always @(
                            glb_req_pvld;
 end
 
+// [3] 二级输出 valid：pending 放行则置 1；已被下游收走且无新请求则回 0；
+//     下游不 ready 时保持（pvld/prdy 协议：valid 一旦拉起不许撤销）
 always @(
   glb_req_pvld
   or csb2glb_req_prdy
@@ -1054,6 +1125,8 @@ always @(
                                csb2glb_req_pvld;
 end
 
+// [4] 输出数据捕获使能 = pending 的放行条件，保证 pd_tmp 与输出 valid
+//     同拍更新、等待下游收走期间数据保持稳定
 always @(
   glb_req_pvld
   or csb2glb_req_prdy
@@ -1062,6 +1135,8 @@ always @(
     csb2glb_req_en = glb_req_pvld & (csb2glb_req_prdy | ~csb2glb_req_pvld);
 end
 
+// [5] 两级 valid 落复位触发器；pd 触发器不复位、仅捕获使能时翻转（省功耗
+//     惯例，'bx 分支只是仿真期的 X 传播检查，综合后不存在）
 always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   if (!nvdla_core_rstn) begin
     glb_req_pvld <= 1'b0;
@@ -1087,9 +1162,12 @@ always @(posedge nvdla_core_clk) begin
   // VCS coverage on
   end
 end
+// [6] 62bit 重打包：{7'h0, nposted[55], write[54], wdat[53:22], 6'h0,
+//     addr[15:0]}——[21:16]/[62:56] 为保留位恒 0
 assign csb2glb_req_pd ={7'h0,csb2glb_req_pd_tmp[49:16],6'h0,csb2glb_req_pd_tmp[15:0]};
 
 
+// ---- cvif 路（0x3000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -1155,6 +1233,7 @@ end
 assign csb2cvif_req_pd ={7'h0,csb2cvif_req_pd_tmp[49:16],6'h0,csb2cvif_req_pd_tmp[15:0]};
 
 
+// ---- cmac_b 路（0x8000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -1220,6 +1299,7 @@ end
 assign csb2cmac_b_req_pd ={7'h0,csb2cmac_b_req_pd_tmp[49:16],6'h0,csb2cmac_b_req_pd_tmp[15:0]};
 
 
+// ---- pdp 路（0xd000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -1285,6 +1365,7 @@ end
 assign csb2pdp_req_pd ={7'h0,csb2pdp_req_pd_tmp[49:16],6'h0,csb2pdp_req_pd_tmp[15:0]};
 
 
+// ---- cdma 路（0x5000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -1350,6 +1431,7 @@ end
 assign csb2cdma_req_pd ={7'h0,csb2cdma_req_pd_tmp[49:16],6'h0,csb2cdma_req_pd_tmp[15:0]};
 
 
+// ---- sdp 路（0xb000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -1415,6 +1497,7 @@ end
 assign csb2sdp_req_pd ={7'h0,csb2sdp_req_pd_tmp[49:16],6'h0,csb2sdp_req_pd_tmp[15:0]};
 
 
+// ---- bdma 路（0x4000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -1480,6 +1563,7 @@ end
 assign csb2bdma_req_pd ={7'h0,csb2bdma_req_pd_tmp[49:16],6'h0,csb2bdma_req_pd_tmp[15:0]};
 
 
+// ---- pdp_rdma 路（0xc000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -1545,6 +1629,7 @@ end
 assign csb2pdp_rdma_req_pd ={7'h0,csb2pdp_rdma_req_pd_tmp[49:16],6'h0,csb2pdp_rdma_req_pd_tmp[15:0]};
 
 
+// ---- mcif 路（0x2000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -1610,6 +1695,7 @@ end
 assign csb2mcif_req_pd ={7'h0,csb2mcif_req_pd_tmp[49:16],6'h0,csb2mcif_req_pd_tmp[15:0]};
 
 
+// ---- cdp_rdma 路（0xe000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -1675,6 +1761,7 @@ end
 assign csb2cdp_rdma_req_pd ={7'h0,csb2cdp_rdma_req_pd_tmp[49:16],6'h0,csb2cdp_rdma_req_pd_tmp[15:0]};
 
 
+// ---- rbk 路（0x10000）：路由/打包逻辑同 glb 路，仅地址段不同 ----
 always @(
   core_byte_addr
   or addr_mask
@@ -1739,6 +1826,11 @@ always @(posedge nvdla_core_clk) begin
 end
 assign csb2rbk_req_pd ={7'h0,csb2rbk_req_pd_tmp[49:16],6'h0,csb2rbk_req_pd_tmp[15:0]};
 
+// ---------------- dummy 兜底路 ----------------
+// 命中条件：上述所有 select 全不中（含恒 0 的 afbif）。作用：访问未映射
+// 地址时总线不挂死——读回 0，non-posted 写回写完成，posted 写直接吞掉；
+// resp_error 恒 0，"访问了不存在的寄存器"这一错误对外完全不可见。
+// dummy 响应无反压问题，因此不设 pending/输出两级，寄存一拍即回
 ////////////////// dummy client //////////////////////
 always @(
   select_afbif
@@ -1820,6 +1912,7 @@ always @(posedge nvdla_core_clk) begin
 end
 
 
+// dummy 响应打包：读/写完成两个模板只差 type 位（[33]）；rdat/error 恒 0
 // PKT_PACK_WIRE_ID( nvdla_xx2csb_resp ,  dla_xx2csb_rd_erpt ,  dummy_resp_ ,  dummy_rresp_pd )
 assign       dummy_rresp_pd[31:0] =     dummy_resp_rdat[31:0];
 assign       dummy_rresp_pd[32] =     dummy_resp_error ;
@@ -1834,6 +1927,8 @@ assign   dummy_wresp_pd[33:33] = 1'd1  /* PKT_nvdla_xx2csb_resp_dla_xx2csb_wr_er
 assign dummy_resp_rdat = {32 {1'b0}};
 assign dummy_resp_error = 1'b0;
 
+// 只有读或 non-posted 写需要回响应（posted 写无回执）；
+// type 仅在 non-posted 写时为 1（写完成）
 assign dummy_resp_valid_w = csb2dummy_req_pvld & (csb2dummy_req_nposted | csb2dummy_req_read);
 assign dummy_resp_type_w = ~csb2dummy_req_read & csb2dummy_req_nposted;
 assign dummy_resp_pd = dummy_resp_type ? dummy_wresp_pd : dummy_rresp_pd;
@@ -1908,6 +2003,9 @@ end
 `endif // SPYGLASS_ASSERT_ON
 
 
+// ---------------- 响应汇聚：19 枝 → 1（下方 17 组同构寄存） ----------------
+// 各单元响应先寄存一拍（valid 复位清 0，pd 仅 valid 时采样）再进 OR-mux：
+// 把 17 个单元的长距离布线在汇聚点前打断，换取扇入端时序裕量
 always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   if (!nvdla_core_rstn) begin
     cmac_a_resp_valid <= 1'b0;
@@ -2231,6 +2329,9 @@ always @(posedge nvdla_core_clk) begin
 end
 
 
+// OR-mux 汇聚：每枝用自家 valid 按位门控后逐枝相或。前提是任意时刻至多
+// 一枝 valid（软件单笔在途约定保证）；若两枝同拍响应，pd 将按位或成无法
+// 分辨来源的混叠值——该前提由下方 zero_one_hot 断言看护
 assign core_resp_pd = ({34 {afbif_resp_pvld}} & afbif_resp_pd)
                     | ({34 {cmac_a_resp_valid}} & cmac_a_resp_pd)
                     | ({34 {sdp_rdma_resp_valid}} & sdp_rdma_resp_pd)
@@ -2270,6 +2371,9 @@ assign core_resp_pvld = afbif_resp_pvld |
                         cdp_rdma_resp_valid |
                         rbk_resp_valid |
                         dummy_resp_valid;
+// 下方断言 zero_one_hot：19 枝响应 valid（17 单元 + afbif + dummy）任意
+// 时刻至多一热。仿真中触发即说明软件违反"单笔在途"约定，或某单元多回
+// 了响应——此时上面的 OR-mux 已混叠，必须当错误处理
 
 `ifdef SPYGLASS_ASSERT_ON
 `else
@@ -2368,6 +2472,7 @@ assign afbif2csb_wresp_error = afbif2csb_wr_error;
     afbif2csb_resp_pd = (afbif2csb_valid) ? afbif2csb_rresp_pd : afbif2csb_wresp_pd;
 &End;
 */
+// afbif 响应枝在 nv_full 拴 0（上面注释块保留原始双 FIFO 例化备查）
 assign  afbif_resp_pvld = 1'b0;
 assign  afbif_resp_pd = 34'h0;
 

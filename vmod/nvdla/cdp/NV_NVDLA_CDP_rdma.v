@@ -8,6 +8,23 @@
 
 // File Name: NV_NVDLA_CDP_rdma.v
 
+// ----------------------------------------------------------------
+// 【端口分组】CDP 读 DMA wrapper：ig（发请求）+ cq（在途上下文队列）+
+// eg（收数据/重排）+ reg（配置寄存器）+ slcg（门控时钟）
+//
+// 端口按接口分四组看：
+//   1) CSB 配置口：csb2cdp_rdma_req_*（62bit 请求）/ cdp_rdma2csb_resp_*
+//      （34bit 响应）——cdp_rdma 独占 0xe000 地址块，与 CDP 数据通路的
+//      0xf000 块各是一个 CSB 目的地；
+//   2) 内存读口 ×2：cdp2mcif_rd_req_*[78:0]（{size,addr} 打包，见
+//      RDMA_ig 注释）+ mcif2cdp_rd_rsp_*[513:0]（{mask,data}）；cvif
+//      同构一套。走哪路由 src_ram_type 决定（1=MC / 0=CV），一层只走一路；
+//   3) 到数据通路口：cdp_rdma2dp_*[86:0]——eg 把乱序返回的读数据按行进
+//      顺序重排后交给 CDP 核；
+//   4) credit 归还：cdp2mcif/cvif_rd_cdt_lat_fifo_pop 脉冲——eg 每消费
+//      一拍读响应归还一份额度，与接口侧 latency 缓冲构成流控闭环
+//      （机制见 RDMA_eg 内注释）。
+// ----------------------------------------------------------------
 module NV_NVDLA_CDP_rdma (
    nvdla_core_clk                //|< i
   ,nvdla_core_rstn               //|< i

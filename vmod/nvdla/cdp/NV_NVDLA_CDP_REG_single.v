@@ -8,6 +8,21 @@
 
 // File Name: NV_NVDLA_CDP_REG_single.v
 
+// ----------------------------------------------------------------
+// 【机制块注】CDP single 寄存器组（块内偏移 0x000~0x044，全 CDP 唯一一份）
+//
+// 承载"跨乒乓共享"的寄存器，即不随 d0/d1 切换的部分：
+//   - S_STATUS  0x000：d0/d1 两组状态（只读，字段由上层 CDP_reg 反灌）；
+//   - S_POINTER 0x004：producer（软件可写）+ consumer（只读，硬件维护）；
+//   - S_LUT_ACCESS_CFG/DATA 0x008/0x00c：LUT 读写窗口，写这两个偏移
+//     会输出 lut_addr_trigger / lut_data_trigger 脉冲，供上层做 LUT
+//     地址装载与自增（LUT 全 CDP 只有一套，故归 single 组）；
+//   - S_LUT_CFG/INFO 0x010/0x014 与 0x018~0x044：LE/LO 两张 LUT 的
+//     区间、斜率、索引选择等参数。
+// 写侧：块内偏移逐地址生成 wren；读侧：组合 case 直通，无等待周期。
+// 本模块只存软件可写位；status/consumer/lut_addr/lut_data 等只读字段
+// 由上层拉线进来拼进读数据。
+// ----------------------------------------------------------------
 module NV_NVDLA_CDP_REG_single (
    reg_rd_data
   ,reg_offset

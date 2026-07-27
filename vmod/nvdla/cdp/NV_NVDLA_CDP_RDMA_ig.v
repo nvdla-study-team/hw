@@ -900,11 +900,20 @@ assign cq_wr_pvld = tran_vld & dma_rd_req_rdy;
 //==============
 // DMA Req : PIPE
 //==============
+// ---------------- DMA 读请求发出（与 cq 同拍成对入队） ----------------
+// 请求发出的前提之一是 cq（上下文队列）有空位：cq 记录每笔在途请求的
+// width/align/last_* 元信息，eg 侧靠它把乱序返回的数据还原成数据通路
+// 的行进顺序；上方断言看护"cq 与 DMA 请求同收同拒"
 // VALID: clamp when when cq is not ready
 assign dma_rd_req_vld = tran_vld & cq_wr_prdy;
 
 // PayLoad
 
+// DMA 读请求打包 dma_rd_req_pd[78:0] = {size[78:64], addr[63:0]}：
+// addr 为 64bit 字节地址；size 为 0 基突发长度（本引擎以 32B 子块计，
+// 0~7 即 1~8 块，与读响应 512bit 数据 + 2bit mask 的两个 32B 半拍对应）。
+// 包格式即 dma_read_cmd，位宽随引擎参数化（CDP 为 79bit）；
+// ram_type（1=MC / 0=CV）不进包，作旁路信号把请求引到 mcif 或 cvif
 // PKT_PACK_WIRE( dma_read_cmd ,  dma_req_ ,  dma_rd_req_pd )
 assign       dma_rd_req_pd[63:0] =     dma_req_addr[63:0];
 assign       dma_rd_req_pd[78:64] =     dma_req_size[14:0];

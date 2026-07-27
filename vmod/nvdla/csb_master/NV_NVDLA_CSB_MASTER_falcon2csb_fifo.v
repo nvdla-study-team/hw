@@ -8,6 +8,23 @@
 
 // File Name: NV_NVDLA_CSB_MASTER_falcon2csb_fifo.v
 
+// ----------------------------------------------------------------
+// 【机制块注】CSB 请求方向 CDC FIFO：falcon 域（写侧）→ core 域（读侧）
+//
+// - 载荷 50bit = {nposted, write, wdat[31:0], addr[15:0]}，深度 4
+//   （flopram 4x50；wr_count 计到 4 即 wr_ready 拉低，反压 CPU/桥）。
+// - fifogen 自动生成的异步 FIFO。跨域不直接同步读写指针，而是把
+//   push/pop 事件折算成 3bit 格雷计数：写侧每 push 一次格雷计数 +1，
+//   整组计数经 p_STRICTSYNC3DOTM_C_PPP（3 级触发器同步器，每 bit 一个）
+//   送到读侧；读侧发现同步值与本地副本不等，即知"来了一笔"并递增本地
+//   副本；pop 事件同理反向同步。格雷码保证相邻计数只有 1bit 翻转，
+//   多 bit 各自过同步器也不会拼出假中间值。
+// - 数据本体存 flopram 不跨域：读侧靠计数差确认写入已稳定才取数。
+// - 单向穿越含同步器约 3~5 拍；CSB 请求+响应端到端 10~20 拍量级——
+//   这是慢速配置通路，深度与延迟都按此定位取舍。
+// - wr_pause_rand：仿真随机写侧 stall（$RollPLI），定义 PRAND_OFF 即关；
+//   各处 NV_CLK_gate_power/DFT 门控只为省功耗与可测性，不改协议行为。
+// ----------------------------------------------------------------
 `define FORCE_CONTENTION_ASSERTION_RESET_ACTIVE 1'b1
 `include "simulate_x_tick.vh"
 module NV_NVDLA_CSB_MASTER_falcon2csb_fifo (

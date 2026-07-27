@@ -8,6 +8,21 @@
 
 // File Name: NV_NVDLA_CSB_MASTER_csb2falcon_fifo.v
 
+// ----------------------------------------------------------------
+// 【机制块注】CSB 响应方向 CDC FIFO：core 域（写侧）→ falcon 域（读侧）
+//
+// - 载荷 34bit = {type[33]（0 读 / 1 写完成）, error[32], rdat[31:0]}，
+//   深度 2（flopram 2x34）。响应流量受"单笔在途"使用约定限制，2 深
+//   已足够；csb_master 内另有断言看护写侧永不堵（pvld 时必 prdy）。
+// - 与 falcon2csb_fifo 同为 fifogen 生成：push/pop 事件折算成格雷计数
+//   （本例 2bit），经 p_STRICTSYNC3DOTM_C_PPP 3 级触发器同步器跨域，
+//   对端以"同步值 != 本地副本"判定有无新事件；格雷码保证相邻计数仅
+//   1bit 翻转，多 bit 分别同步不会拼出假中间值。数据本体存 flopram
+//   不跨域，靠计数差保证读侧取数时写入已稳定。
+// - 读侧 rd_ready 在 csb_master 里拴 1：响应到达即被无条件取走。
+// - 仿真随机 stall（PRAND/$RollPLI）定义 PRAND_OFF 即关；
+//   时钟门控（SLCG/DFT）只省功耗，不改协议行为。
+// ----------------------------------------------------------------
 `define FORCE_CONTENTION_ASSERTION_RESET_ACTIVE 1'b1
 `include "simulate_x_tick.vh"
 module NV_NVDLA_CSB_MASTER_csb2falcon_fifo (

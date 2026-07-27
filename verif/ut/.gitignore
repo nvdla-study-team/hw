@@ -1,0 +1,12 @@
+# 仿真产物（make clean 可清）
+out/
+out_waves/
+csrc/
+simv*
+ucli.key
+vc_hdrs.h
+novas.*
+verdiLog/
+*.fsdb
+*.log
+tr_db.log
