@@ -11,6 +11,8 @@
 +incdir+../common/base
 +incdir+../common/csb
 +incdir+../common/dma
++incdir+../common/cbuf
++incdir+../common/cdma_sc
 +incdir+../common/intr
 +incdir+env
 +incdir+seqs
@@ -40,6 +42,9 @@
 ../common/csb/csb_if.sv
 ../common/csb/csb_fanout_if.sv
 ../common/dma/dma_if.sv
+../common/cbuf/cbuf_wr_if.sv
+../common/cbuf/cbuf_rd_if.sv
+../common/cdma_sc/cdma_sc_if.sv
 ../common/intr/intr_if.sv
 
 // ---- package ----

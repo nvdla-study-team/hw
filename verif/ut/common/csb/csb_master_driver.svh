@@ -40,6 +40,11 @@ class csb_master_driver extends uvm_driver #(csb_seq_item);
         repeat (2) @(vif.drv_cb);
       end
 
+      // 先对齐一拍再驱动：get_next_item 可能在非时钟事件时刻返回（测试代码
+      // #delay 后直呼序列任务的场景），此时 idle_before=0 的请求 valid 起落
+      // 会落到同一 clocking 事件上被 last-wins 吞掉、driver 误判已发出请求
+      // 而永等响应（cdma_cbuf T6 实测抓到）。统一对齐消除竞态。
+      @(vif.drv_cb);
       repeat (tr.idle_before) @(vif.drv_cb);
 
       // 发请求，等握手
