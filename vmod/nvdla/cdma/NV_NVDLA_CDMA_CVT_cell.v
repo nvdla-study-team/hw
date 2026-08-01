@@ -8,6 +8,20 @@
 
 // File Name: NV_NVDLA_CDMA_CVT_cell.v
 
+// ----------------------------------------------------------------
+// 【机制总览】CVT cell：单元素精度转换器（Catapult HLS 生成，勿手改）
+//
+// 顶层包装是文件末尾的 NV_NVDLA_CDMA_CVT_cell；其余 CDMA_mgc_*（Mentor
+// 例程库）、*_rsci*（通道握手）、*_core_fsm/staller 均为 HLS 调度产物，
+// 阅读时只需认端口语义：
+//   chn_data_in_rsc_z[16:0]  op0：输入元素（16b + 1b 符号扩展位）
+//   chn_alu_in_rsc_z[15:0]   op1：减数（mean 或 CVT offset，由 cvt.v 选）
+//   cfg_mul_in_rsc_z[15:0]   scale 乘数（D_CVT_SCALE）
+//   cfg_truncate[5:0]        右移位数（D_CVT_TRUNCATE）
+//   chn_data_out_rsc_z[15:0] 结果，按 out_precision 饱和到 int8/int16
+// 功能即 out = saturate(((op0 − op1) × scale) >> truncate)，固定 5 拍
+// 延迟（cvt.v 的 stage2 流水以此对齐）。64 份实例见 cvt.v
+// ----------------------------------------------------------------
 module CDMA_mgc_in_wire_wait_v1 (ld, vd, d, lz, vz, z);
 
   parameter integer rscid = 1;

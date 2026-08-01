@@ -8,6 +8,40 @@
 
 // File Name: NV_NVDLA_cbuf.v
 
+// ----------------------------------------------------------------
+// 【机制总览】cbuf：512KB 卷积缓冲，CDMA 写入 / CSC 读出的中转 RAM 阵列
+//
+// 一、物理组织：16 bank × 2 column × nv_ram_rws_256x512
+//   每 RAM 256 深 × 512bit（16KB）；一个 bank = 2 column = 32KB。
+//   entry = 1024bit(128B) = 同 bank 同地址的 c0(低 512b)+c1(高 512b)。
+//   地址 [11:8]=bank、[7:0]=bank 内 entry 序号，全空间 4096 entry。
+//   bank 划分按层配置：bank0 起是数据区，其后到 bank15 是权重区；
+//   压缩模式的 WMB 固定占 bank15（所以有 dat 禁写 bank15、wt 禁写
+//   bank0 的断言——数据区至少 1 个 bank，权重区至少 1 个 bank）。
+//
+// 二、写口 ×2（无 ready 反压，上游 CDMA 自己保证不超带宽）
+//   p0=dat（1024b + hsel[1:0]）：hsel 是【半字使能】——bit0 写低 512b
+//   进 c0、bit1 写高 512b 进 c1，可只写一半；hsel==0 属非法（断言）。
+//   p1=wt（512b + 1bit hsel）：每拍只有 512b，hsel 选列（0→c0/1→c1），
+//   两拍拼满一个 entry；权重数据与 WMB 都走这个口（按 bank 区分）。
+//   写流水：入口打 1 拍（sel/addr/data d1）→ 再打 1 拍（d2）→ RAM 写，
+//   即 banner 所记 "write latency 4 cycle（含 RAM 自身 1 拍）"。
+//
+// 三、读口 ×3（固定 6 拍延迟，无反压、无乱序，interval 断言钉死 6 拍）
+//   p0=dat、p1=wt（12bit 地址，整 bank 解码）；p2=wmb（8bit 地址，
+//   固定读 bank15，不做 bank 解码）。每次读同时使能该 bank 的 c0+c1
+//   两个 RAM，拼出 1024b。流水：入口解码 → d1..d3（含 retiming 级，
+//   物理上跨分区布线）→ RAM 读 1 拍 → d4 按 sel_d3 选 bank 数据 →
+//   d5/d6 retiming/输出寄存。rd_en 打 6 拍成 rd_valid；data_d6 仅在
+//   对应 valid 拍刷新，空闲时保持旧值（省翻转，下游只认 valid 拍）。
+//
+// 四、冲突规则：cbuf 内部【零仲裁】。每 bank 每 column 就是一读一写
+//   口 RAM，同拍多客户端碰同一 bank 的约束全靠上游分工遵守，文末一排
+//   断言兜底：dat/wt 写不同 bank、dat/wt 读不同 bank、wt 读与 wmb 读
+//   不撞 bank15、读写不撞同 entry、dat 写与 wt 读（及对偶）不撞 bank。
+//   本文件主体是 16 bank × 2 column 的机械重复展开，只需读一个 bank
+//   的模式即可理解全部；下方各段落头注释标注了每段的语义。
+// ----------------------------------------------------------------
 `include "simulate_x_tick.vh"
 module NV_NVDLA_cbuf (
    nvdla_core_clk       //|< i
@@ -857,6 +891,9 @@ reg    [59:0] cbuf_wr_sel_ram_d1;
 // Input write stage1: connect to retiming registers                  //
 ////////////////////////////////////////////////////////////////////////
 
+// hsel 半字使能语义：dat 口 1024b 拆成 lo/hi 两个 512b 独立写使能
+// （lo→column0、hi→column1），cvt 只凑齐半个 entry 时可以只写一半；
+// wt 口每拍本来就只有 512b，单 bit hsel 直接当列选择用
 assign cbuf_p0_wr_en       = cdma2buf_dat_wr_en;
 assign cbuf_p0_wr_lo_en    = cdma2buf_dat_wr_en & cdma2buf_dat_wr_hsel[0];
 assign cbuf_p0_wr_hi_en    = cdma2buf_dat_wr_en & cdma2buf_dat_wr_hsel[1];
@@ -884,6 +921,11 @@ assign cbuf_p1_wr_hi_en_d1_w = cbuf_p1_wr_hi_en;
 ////////////////////////////////////////////////////////////////////////
 // Input write stage1: misc logic                                     //
 ////////////////////////////////////////////////////////////////////////
+// bank 解码 + 每 RAM 写选择：addr[11:8] 与各 bank 号比较、与半字使能
+// 相与，得到 one-hot 写选通 *_sel_ram_bXcY_w。注意 sel 共 60 个而非 64：
+// p0(dat) 只解码 b0..b14、p1(wt) 只解码 b1..b15——「dat 不进 bank15、
+// wt 不进 bank0」的分区规则直接硬编码在解码范围里，越界写会被静默丢弃
+// （另有断言抓）。以下为逐 bank 机械重复，看懂 b0c0/b0c1 一组即可
 assign cbuf_p0_wr_bank = cbuf_p0_wr_addr[12-1:8];
 assign cbuf_p1_wr_bank = cbuf_p1_wr_addr[12-1:8];
 
@@ -1727,6 +1769,9 @@ end
 ////////////////////////////////////////////////////////////////////////
 // Input write stage2: write connection to RAM                         //
 ////////////////////////////////////////////////////////////////////////
+// d1 拍的 sel 解包后，把 p0/p1 两个写口的 addr/data 用 sel 掩码汇到每
+// 个 RAM 私有的 wa/wdat 上（p0、p1 不同 bank，按位或不会混叠——正是
+// "dat/wt 写不撞 bank"断言守护的前提），再打 d2 拍接 RAM 写口
 assign {cbuf_p0_wr_sel_ram_b0c0_d1,
         cbuf_p0_wr_sel_ram_b0c1_d1,
         cbuf_p0_wr_sel_ram_b1c0_d1,
@@ -3094,6 +3139,9 @@ end
 ////////////////////////////////////////////////////////////////////////
 // Instance RAMs                                                      //
 ////////////////////////////////////////////////////////////////////////
+// 32 个同构 RAM（16 bank × 2 column，rws = 一读一写口可同拍），写侧接
+// d2 级寄存信号，读侧 ra/re 为寄存输出、dout 下一拍有效。bank 间完全
+// 独立，这就是"不同客户端只要不撞同一 bank 就无冲突"的物理依据
 
 nv_ram_rws_256x512 u_cbuf_ram_bank0_column0 (
    .clk           (nvdla_core_clk)            //|< i
@@ -3481,6 +3529,10 @@ nv_ram_rws_256x512 u_cbuf_ram_bank15_column1 (
 ////////////////////////////////////////////////////////////////////////
 // Input read stage1: rename signals                                  //
 ////////////////////////////////////////////////////////////////////////
+// 三个读客户端（均来自 CSC）：p0=dat、p1=wt 带 12bit 全地址；p2=wmb
+// 只有 8bit bank 内地址——它固定读 bank15（下方 p2 的 sel 不做 bank
+// 比较，rd_en 即选中 b15 两列）。读是 fire-and-forget：无 ready，
+// 发出后恰好 6 拍返回 valid+data
 
 assign cbuf_p0_rd_en    = sc2buf_dat_rd_en;
 assign cbuf_p0_rd_addr  = sc2buf_dat_rd_addr[12-1:0];
@@ -3495,6 +3547,8 @@ assign cbuf_p2_rd_addr  = sc2buf_wmb_rd_addr;
 ////////////////////////////////////////////////////////////////////////
 // Input read stage1: misc logic                                      //
 ////////////////////////////////////////////////////////////////////////
+// 读 bank 解码：与写侧同构，但每次读把同 bank 的 c0/c1 两列一起使能
+// （同一 sel 条件复制两份），d4 拍再拼成 1024b entry。逐 bank 机械重复
 assign cbuf_p0_rd_bank = cbuf_p0_rd_addr[12-1:8];
 assign cbuf_p1_rd_bank = cbuf_p1_rd_addr[12-1:8];
 
@@ -5753,6 +5807,8 @@ end
 ////////////////////////////////////////////////////////////////////////
 // Input read stage4: select output data                              //
 ////////////////////////////////////////////////////////////////////////
+// RAM dout 已在 d3 拍寄存；此处按 sel_d3（读发起时的 bank one-hot，随
+// 流水同步延迟到 d3）从 32 路 dout 中掩码选出本口数据，c0/c1 各 512b
 assign {cbuf_p0_rd_sel_ram_b0c0_d3,
         cbuf_p0_rd_sel_ram_b0c1_d3,
         cbuf_p0_rd_sel_ram_b1c0_d3,
@@ -6286,6 +6342,10 @@ end
 ////////////////////////////////////////////////////////////////////////
 // Connect to output signals                                          //
 ////////////////////////////////////////////////////////////////////////
+// 读出口：rd_en 经 6 级打拍成 rd_valid（固定 6 拍延迟、无反压，下方
+// nv_assert_at_time_interval #(0,6,...) 三个断言钉死该时序契约，CSC 端
+// 的取数流水按此常数设计）；data_d6 只在对应半字 valid 时刷新，无读
+// 期间保持旧值，下游必须只在 valid 拍采样
 
 assign sc2buf_dat_rd_data       = cbuf_p0_rd_data_d6;
 assign sc2buf_dat_rd_valid      = cbuf_p0_rd_valid_d6;
@@ -6295,6 +6355,16 @@ assign sc2buf_wt_rd_valid      = cbuf_p1_rd_valid_d6;
 
 assign sc2buf_wmb_rd_data       = cbuf_p2_rd_data_d6;
 assign sc2buf_wmb_rd_valid      = cbuf_p2_rd_valid_d6;
+
+// ---------------- 以下为接口契约断言区（仅仿真） ----------------
+// 访问规则汇总（cbuf 自身不做任何冲突仲裁，全靠这些断言把关）：
+//   1) dat 写 hsel 不得为 0；dat 写/读不得碰 bank15；wt 写/读不得碰 bank0
+//   2) 同拍不同客户端不撞 bank：dat写/wt写、dat读/wt读、dat写/wt读、
+//      wt写/dat读均须异 bank；wt 读与 wmb 读不同时碰 bank15
+//   3) 读写同拍不撞同 entry（dat、wt、wmb 各自）
+//   4) 三个读口 en→valid 恰为 6 拍（nv_assert_at_time_interval #(0,6,..)）
+// 注意：末尾 4 条 eccgen 断言引用的 *_ready_out 和 *_en_d1_w 在本配置
+// 中无驱动（ECC 变体的残留），不构成有效检查
 
 
 
@@ -6800,6 +6870,10 @@ assign sc2buf_wmb_rd_valid      = cbuf_p2_rd_valid_d6;
 `endif // FV_ASSERT_ON
 `ifndef SYNTHESIS
   // VCS coverage off 
+  // 【疑上游笔误·警示】本断言意图是抓"wt 写 bank15 与 wmb 读同 entry"，
+  // 但地址比较用的是 sc2buf_wt_rd_addr（wt 读口，12 位）而非
+  // sc2buf_wmb_rd_addr（wmb 读口，8 位）——8 位对 12 位比较且对象错口，
+  // 检查目标错位，实际未覆盖 wmb 读写冲突。保留原逻辑不改，仅记录
   nv_assert_never #(0,0,"Error! Convolution buffer wmb read & write port hazard!")      zzz_assert_never_11x (nvdla_core_clk, `ASSERT_RESET, (cdma2buf_wt_wr_en & sc2buf_wmb_rd_en & (cdma2buf_wt_wr_addr[7:0] == sc2buf_wt_rd_addr) & (cdma2buf_wt_wr_addr[11:8] == 4'hf))); // spyglass disable W504 SelfDeterminedExpr-ML 
   // VCS coverage on
 `endif

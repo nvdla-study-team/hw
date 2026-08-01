@@ -8,6 +8,44 @@
 
 // File Name: NV_NVDLA_CDMA_status.v
 
+// ----------------------------------------------------------------
+// 【机制总览】CDMA status：cbuf 数据区记账 + 层完成判定/切层 + 层间清账
+//
+// 一、记账（entry/slice 双计数，只管数据区，权重区归 u_wt 自己记）
+//   计量单位：entry = cbuf 一行 128B；slice = 一个 W×C 输入平面；
+//   bank = 256 entry（32KB）。real_bank = reg2dp_data_bank + 1（寄存器按
+//   N-1 编码），数据区总容量 = real_bank×256 entry（{real_bank,8'b0}）。
+//   增量：dc/wg/img 三通路互斥，谁活跃谁报 *2status_dat_updt +
+//         entries/slices 增量（断言保证不会两路同时报）；
+//   减量：CSC 消费完经 sc2cdma_dat_updt 归还 entries/slices；
+//   valid_entries/valid_slices = 累加(增) − 累加(减)；
+//   free_entries = real_bank×256 − valid_entries（DMA 据此决定还能预取
+//   多少）；wr_idx 为数据区内循环写指针，加增量后 ≥ real_bank×256 则
+//   减容量回绕（数据区是 entry 粒度的环形缓冲）。
+//
+// 二、层完成判定与切层（dat+wt 双 done 才算完）
+//   每个 DMA 子通路暴露 2bit 状态：0=idle、1=pend、2=busy、3=done。
+//   dat 侧 done = dc|wg|img 任一 done（三者互斥）；必须 dat 与 wt 两侧
+//   都到 done，才产生单拍 status2dma_fsm_switch（自身为高时压掉下一拍，
+//   保证一层只切一次）。fsm_switch 即 dp2reg_done：同拍让 regfile 翻转
+//   consumer/清 op_en，也让各子通路 FSM 从 done 回 idle 开始下一层。
+//
+// 三、done 中断（dat/wt 独立两口，bit 序号 = 寄存器组号）
+//   *_done_intr_pd[0] 对应 group0、[1] 对应 group1（按当拍 consumer 指
+//   针归属），对 done 上升沿检测（~done_d1 & done）出单拍脉冲。注意
+//   wt 与 dat 各自独立出中断：一侧先完成即可先报，不等 fsm_switch。
+//
+// 四、pending 清账握手（层间重配 data_bank 时由 CSC 发起）
+//   CSC 拉 sc2cdma_dat_pending_req；新层 op_en 后活跃 DMA 通路进 pend
+//   态（state==1），status 据此回 cdma2sc_dat_pending_ack；req 与 ack
+//   同高的那拍把 valid_entries/valid_slices/wr_idx 全部清零——bank 划分
+//   已变，旧账作废，双方从零重新开始记账。
+//
+// 五、cdma2sc_dat_updt 出口延迟 9 拍（d0→d9 打拍链）
+//   DMA 报增量的时刻在"决定写 cbuf"处，早于数据真正落入 cbuf RAM
+//   （还要过 cvt 流水与 cbuf 写流水）；把 updt 压 9 拍再告知 CSC，
+//   保证 CSC 收到后立刻发读也读不到未写完的 entry。
+// ----------------------------------------------------------------
 module NV_NVDLA_CDMA_status (
    nvdla_core_clk
   ,nvdla_core_rstn
@@ -197,6 +235,8 @@ input dp2reg_consumer;
 ////////////////////////////////////////////////////////////////////////
 //  control CDMA working status                                       //
 ////////////////////////////////////////////////////////////////////////
+// 各子通路 2bit 状态解码：3=done、1=pend（0=idle、2=busy 这里不关心）。
+// done 用于切层判定，pend 用于清账握手回 ack
 always @(
   wt2status_state
   ) begin
@@ -247,6 +287,9 @@ always @(
     dat2status_done = (dc2status_done | wg2status_done | img2status_done);
 end
 
+// 切层条件：dat 侧（三通路取或，互斥性有断言兜底）与 wt 侧【都】done。
+// ~status2dma_fsm_switch 自屏蔽：置起的下一拍强制回零，即使 done 电平
+// 还没撤也只出一拍脉冲——fsm_switch/dp2reg_done 的单拍语义由此保证
 always @(
   reg2dp_op_en
   or status2dma_fsm_switch
@@ -256,6 +299,9 @@ always @(
     status2dma_fsm_switch_w = reg2dp_op_en & ~status2dma_fsm_switch & wt2status_done & dat2status_done;
 end
 
+// done 中断脉冲生成：~done_d1 & done 取上升沿（done_d1 打拍时带 op_en
+// 门控），bit 选择 = 当拍 consumer 指针——本层配置属于哪组寄存器，中断
+// 就报在哪个 bit，GLB 按组分别置 status 位。wt 侧不等 dat 侧，先完先报
 always @(
   reg2dp_op_en
   or dp2reg_consumer
@@ -312,6 +358,8 @@ always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   end
 end
 
+// dp2reg_done 就是 fsm_switch（单拍）：同一拍完成 regfile 的 consumer
+// 翻转与该组 op_en 清零、性能计数落档，以及各子通路 FSM 的 done→idle
 assign dp2reg_done = status2dma_fsm_switch;
 assign cdma_wt2glb_done_intr_pd = wt_done_intr;
 assign cdma_dat2glb_done_intr_pd = dat_done_intr;
@@ -415,6 +463,8 @@ assign cdma_dat2glb_done_intr_pd = dat_done_intr;
 //  manage data bank status                                           //
 ////////////////////////////////////////////////////////////////////////
 
+// layer_end：切层置 1、op_en 清 0 的层间标志，当前无下游读者（仅自保持，
+// 观测用残留逻辑）
 always @(
   status2dma_fsm_switch
   or reg2dp_op_en
@@ -425,6 +475,8 @@ always @(
                   layer_end;
 end
 
+// DATA_BANK 寄存器按 N-1 编码，+1 得真实 bank 数；只在 op_en 期间且值
+// 变化时载入（层执行中软件改不了该寄存器，实际就是新层生效点采样一次）
 always @(
   reg2dp_data_bank
   ) begin
@@ -439,6 +491,8 @@ always @(
     real_bank_reg_en = reg2dp_op_en && (real_bank_w != real_bank);
 end
 
+// 清账握手的 ack 条件：新层 op_en 已置、且活跃 DMA 通路已进 pend 态
+// （表示它已看到 pending_req、停在安全点，不会再有在途写入增量）
 always @(
   reg2dp_op_en
   or dc2status_pend
@@ -456,6 +510,8 @@ always @(
     update_dma = dc2status_dat_updt | wg2status_dat_updt | img2status_dat_updt;
 end
 
+// 记账寄存器组的统一写使能：DMA 报增量、CSC 报释放、或清账（req&ack
+// 同高）三种事件任一发生才动计数器
 always @(
   update_dma
   or sc2cdma_dat_updt
@@ -485,6 +541,8 @@ always @(
     entries_sub = sc2cdma_dat_updt ? sc2cdma_dat_entries : 12'b0;
 end
 
+// valid_entries 记账主体：+DMA 写入 −CSC 释放；清账事件优先直接归零。
+// 高位 mon_* 是借位/进位监视位（增减同拍可叠加，正常不应下溢）
 always @(
   pending_ack
   or pending_req
@@ -529,6 +587,9 @@ always @(
                                   status2dma_valid_slices + slices_add - slices_sub;
 end
 
+// 核心公式：free_entries = real_bank×256 − valid_entries
+// （{real_bank,8'b0} 即 ×256：一个 bank = 256 entry = 32KB/128B）。
+// 用 *_w 新值参与运算，free 与 valid 同拍一致；DMA 侧据 free 限流预取
 always @(
   real_bank
   or status2dma_valid_entries_w
@@ -544,6 +605,8 @@ always @(
     entries_reg_en = (status2dma_free_entries_w != status2dma_free_entries);
 end
 
+// wr_idx：数据区 entry 粒度环形写指针。加本次增量后若 ≥ real_bank×256
+// 则减掉总容量回绕；仅 DMA 报增量（update_dma）时前进，清账时归零
 always @(
   status2dma_wr_idx
   or entries_add
@@ -894,6 +957,8 @@ end
 // spyglass enable_block WRN_58 
 // spyglass enable_block WRN_61 
 `endif // SPYGLASS_ASSERT_ON
+// pending req/ack 各打一拍：req 是 CSC 电平请求，ack 电平回应；上面记账
+// 逻辑以 (pending_ack & pending_req) 作清账事件（层间 bank 重配的对账点）
 always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   if (!nvdla_core_rstn) begin
     pending_ack <= 1'b0;
@@ -911,6 +976,10 @@ end
 
 assign cdma2sc_dat_pending_ack = pending_ack;
 
+// 以下 d0→d9 打拍链：把 DMA 报增量事件（updt+entries+slices 成组）延迟
+// 9 拍再发给 CSC（cdma2sc_dat_*），掩盖 cvt→cbuf 写流水在途拍数——CSC
+// 收到 updt 时对应 entry 已实际写入 cbuf，立即读也安全。entries/slices
+// 仅在前级 updt 有效时打拍（省翻转），updt 逐拍搬运保证事件不丢不重
 assign dat_updt_d0 = update_dma;
 assign dat_entries_d0 = entries_add;
 assign dat_slices_d0 = slices_add;
@@ -2075,6 +2144,7 @@ end
 // spyglass enable_block WRN_58 
 // spyglass enable_block WRN_61 
 `endif // SPYGLASS_ASSERT_ON
+// 9 拍延迟后的增量事件出口：CSC 端以此维护自己的 dat 记账副本
 assign cdma2sc_dat_updt = dat_updt_d9;
 assign cdma2sc_dat_entries = dat_entries_d9;
 assign cdma2sc_dat_slices = dat_slices_d9;

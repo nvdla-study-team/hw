@@ -8,6 +8,31 @@
 
 // File Name: NV_NVDLA_CDMA_dma_mux.v
 
+// ----------------------------------------------------------------
+// 【机制总览】dat 读口三合一 mux：dc/wg/img → 一对 MCIF/CVIF 接口
+//
+// 关键前提：dc/wg/img 按层互斥，同一时刻至多一路发请求——所以本模块
+// 【没有仲裁器】，req 方向是纯 OR 汇合，rsp 方向靠寄存的客户端标志分流；
+// 文末 one-hot 断言（"MCIF/CVIF sel conflict!"）兜住互斥前提被破坏的情况。
+//
+// 一、req 方向（MCIF 与 CVIF 各一套，结构相同）
+//   合并：pvld = 三家 valid 取或；pd = 按各家 valid 做掩码或（多家同时
+//   拉高会出乱码——这正是互斥前提的意义）。ready 回程：req_*_in_prdy
+//   原样广播给三家（与各家 valid 相与只是防误握手）。
+//   合并后过一级 pipe（skid buffer + bubble-collapse 两段，pipe 插件
+//   生成）：正反向各打一拍做时序切断，反压时数据落进 skid 寄存器不丢。
+//
+// 二、rsp 方向分流（demux）
+//   mc_sel_* 与 cv_sel_* 在每次 req 被接受（pvld&prdy）时寄存「这笔是谁
+//   发的」；rsp 回来时按该标志把 valid/pd 路由回原客户端，ready 也按标志
+//   反选。注意这不是按 outstanding 顺序记账的 tag 队列——正因为切层前
+//   活跃客户端唯一且 rsp 不会跨层滞留，一个标志位就够。
+//   rsp 同样先过一级 skid+bc pipe 再分流。
+//
+// 三、时延/吞吐
+//   req、rsp 各增加 1 拍固定延迟（pipe 级），全通路保持每拍一笔的吞吐；
+//   本模块不生成也不消费事务，纯连线级联，无 credit/深度概念。
+// ----------------------------------------------------------------
 module NV_NVDLA_CDMA_dma_mux (
    nvdla_core_clk
   ,nvdla_core_rstn
@@ -262,6 +287,8 @@ reg            wg_dat2mcif_rd_req_ready;
 // Data request channel                                               //
 ////////////////////////////////////////////////////////////////////////
 //////////////// MCIF interface ////////////////
+// sel_w 即各家 valid 本身（互斥前提下天然 one-hot），一方面作 pd 合并
+// 掩码，另一方面在请求被接受时寄入 mc_sel_*，供 rsp 方向认领回数据
 always @(
   dc_dat2mcif_rd_req_valid
   or wg_dat2mcif_rd_req_valid
@@ -295,6 +322,10 @@ always @(
                    ({79 {mc_sel_img_w}} & img_dat2mcif_rd_req_pd);
 end
 
+// pipe(1)：req 汇合点 → MCIF 出口的一级流水（pipe 插件展开产物）。
+// skid buffer 段把 ready 打拍（下游反压当拍先记入 skid 寄存器，数据不
+// 丢）；bubble-collapse 段把 valid/data 打拍且空拍时允许新数据直进——
+// 合起来 valid/ready 双向均为寄存器输出，切断跨模块时序路径
 //## pipe (1) skid buffer
 always @(
   req_mc_in_pvld
@@ -464,6 +495,8 @@ wire p1_assert_clk = nvdla_core_clk;
 `endif // SPYGLASS_ASSERT_ON
 `endif
 
+// ready 回程：prdy 对三家等价广播，与各家 valid 相与只为不给未发请求的
+// 客户端造出假握手；不存在"给谁 ready"的选择，选择权在互斥的 valid 侧
 always @(
   req_mc_in_prdy
   or dc_dat2mcif_rd_req_valid
@@ -485,6 +518,9 @@ always @(
     req_mc_out_prdy = cdma_dat2mcif_rd_req_ready;
 end
 
+// rsp 认领标志：req 握手成立的拍把"发起方是谁"寄下来。同层内发起方不
+// 变，标志实际长期稳定；层切换后第一笔新请求自然改写它。前提是旧层
+// rsp 已全部回收（fsm_switch 前各 DMA 保证收完在途响应）
 always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   if (!nvdla_core_rstn) begin
     mc_sel_dc <= 1'b0;
@@ -670,6 +706,8 @@ end
 `endif // SPYGLASS_ASSERT_ON
 
 //////////////// CVIF interface ////////////////
+// CVIF（SRAM 接口）req 通路：与上面 MCIF 完全同构（OR 汇合 + pipe(2) +
+// cv_sel_* 认领标志），仅目的接口不同。每层按 datain_ram_type 选走一边
 always @(
   dc_dat2cvif_rd_req_valid
   or wg_dat2cvif_rd_req_valid
@@ -1413,6 +1451,9 @@ end
 // Data response channel                                              //
 ////////////////////////////////////////////////////////////////////////
 //////////////// MCIF interface ////////////////
+// rsp 分流通路：MCIF 回数据 → pipe(3)（skid+bc，同 req 侧结构）→ 按
+// mc_sel_* 把 valid/pd 点给发起方、ready 从发起方反选回来。分流是纯组
+// 合 demux，不改变事务内容与顺序
 always @(
   mcif2cdma_dat_rd_rsp_valid
   or mcif2cdma_dat_rd_rsp_pd
@@ -1592,6 +1633,9 @@ wire p3_assert_clk = nvdla_core_clk;
 `endif // SPYGLASS_ASSERT_ON
 `endif
 
+// demux 本体：valid 点名、pd 掩码、ready 反选，全部由 mc_sel_* 一个
+// one-hot 标志决定；sel 全 0（复位后无请求）时 rsp_mc_out_prdy=0，
+// 意外回数据会被反压在 pipe 里而不是错发给某家
 always @(
   rsp_mc_out_pvld
   or mc_sel_dc
@@ -1628,6 +1672,7 @@ always @(
 end
 
 //////////////// CVIF interface ////////////////
+// CVIF rsp 分流：与 MCIF rsp 同构（pipe(4) + cv_sel_* demux）
 always @(
   cvif2cdma_dat_rd_rsp_valid
   or cvif2cdma_dat_rd_rsp_pd

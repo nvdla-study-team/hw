@@ -8,6 +8,18 @@
 
 // File Name: NV_NVDLA_CDMA_regfile.v
 
+// ----------------------------------------------------------------
+// 【机制总览】CDMA 寄存器组：single 组 + d0/d1 双影子组的 ping-pong
+//
+// - single 组（u_single_reg，低地址）：POINTER/STATUS/ARBITER 等即时生效
+//   寄存器。其中 producer 指针由软件写（选择 CSB 配置写进 d0 还是 d1），
+//   consumer 指针由硬件维护（当前数据通路正在消费哪组）。
+// - d0/d1（u_dual_reg_*，高地址）：同一套层配置的两份影子。软件配好一组
+//   并写其 OP_EN 后即可去配另一组，硬件做完一层（dp2reg_done）自动翻转
+//   consumer 换用另一组——两层配置零间隙衔接。
+// - 本文件大部分是 Ordt 风格的机械 mux/flop（CSB 读写通路），机制要点
+//   集中在下方 CONSUMER POINTER / OP_EN / ACCESS(decode) 三段的注释。
+// ----------------------------------------------------------------
 `include "simulate_x_tick.vh"
 module NV_NVDLA_CDMA_regfile (
    nvdla_core_clk             //|< i
@@ -708,6 +720,8 @@ NV_NVDLA_CDMA_dual_reg u_dual_reg_d1 (
 // GENERATE CONSUMER PIONTER IN GENERAL SINGLE REGISTER GROUP         //
 //                                                                    //
 ////////////////////////////////////////////////////////////////////////
+// consumer 指针（硬件独占维护）：每收到一次 dp2reg_done（status 判定一层
+// 的 dat+wt 双侧完成）翻转一次，指向下一组待消费配置。软件只读不写
 assign dp2reg_consumer_w = ~dp2reg_consumer;
 always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   if (!nvdla_core_rstn) begin
@@ -776,6 +790,10 @@ end
 // GENERATE TWO STATUS FIELDS IN GENERAL SINGLE REGISTER GROUP        //
 //                                                                    //
 ////////////////////////////////////////////////////////////////////////
+// S_STATUS 里两组各自的状态：0=idle（该组 OP_EN 未置）；置了 OP_EN 后，
+// consumer 正指向本组为 1（running 正被消费），指向另一组为 2（pending
+// 排队等消费）。注意编码方向：group0 的判断条件写作 consumer==1 → 2，
+// 即"consumer 不在本组"才是 pending，与 NVDLA 手册枚举一致
 always @(
   reg2dp_d0_op_en
   or dp2reg_consumer
@@ -799,6 +817,10 @@ end
 // GENERATE OP_EN LOGIC                                               //
 //                                                                    //
 ////////////////////////////////////////////////////////////////////////
+// 每组 op_en 的生命周期：软件写该组 D_OP_EN（*_op_en_trigger 来自对应
+// dual_reg 的写选通）置位——仅在当前为 0 时接受，置位期间该组寄存器被
+// decode 段锁写；硬件层完成（dp2reg_done）且 consumer 正指向该组时清零。
+// 即"软件置位、硬件清零"，一组一层，用完自动失效
 always @(
   reg2dp_d0_op_en
   or reg2dp_d0_op_en_trigger
@@ -845,6 +867,9 @@ always @(
     reg2dp_op_en_ori = dp2reg_consumer ? reg2dp_d1_op_en : reg2dp_d0_op_en;
 end
 
+// 广播给数据通路的 reg2dp_op_en 取 consumer 所指组的 op_en，但经 3 级移位
+// 延迟——与下面 slcg_op_en 的 3 拍延迟同步，保证各子模块的门控时钟先开、
+// 随后才见到 op_en 上升沿；done 时移位链整体清零，op_en 立即撤销无拖尾
 assign reg2dp_op_en_reg_w = dp2reg_done ? 3'b0 :
                             {reg2dp_op_en_reg[1:0], reg2dp_op_en_ori};
 
@@ -858,6 +883,8 @@ end
 
 assign reg2dp_op_en = reg2dp_op_en_reg[3-1];
 
+// slcg_op_en：8 个门控域共用同一个使能（当前实现不区分域），复制 8 份并
+// 打 3 拍——与 reg2dp_op_en 的移位延迟等长，二者同拍生效/撤销
 assign slcg_op_en_d0 = {8{reg2dp_op_en_ori}};
 
 always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
@@ -894,10 +921,15 @@ assign slcg_op_en = slcg_op_en_d3;
 //                                                                    //
 ////////////////////////////////////////////////////////////////////////
 //EACH subunit has 4KB address space
+// decode：CDMA 的 4KB 空间内，页内偏移 < 0x010 的是 single 组（POINTER/
+// STATUS 等），>= 0x010 的 D_* 配置寄存器按 producer 指针路由到 d0 或
+// d1——软件访问双组共用同一段地址，靠先写 S_POINTER 选组，而非两段映射
 assign select_s  = (reg_offset[11:0] < (32'h5010  & 32'hfff)) ? 1'b1: 1'b0;
 assign select_d0 = (reg_offset[11:0] >= (32'h5010  & 32'hfff)) & (reg2dp_producer == 1'h0 );
 assign select_d1 = (reg_offset[11:0] >= (32'h5010  & 32'hfff)) & (reg2dp_producer == 1'h1 );
 
+// 写保护：某组 op_en 置位期间丢弃对该组的写（配置执行中不可改），并有
+// 下方断言当场抓这类非法写；读不受限，随时可查任一组
 assign s_reg_wr_en  = reg_wr_en & select_s;
 assign d0_reg_wr_en = reg_wr_en & select_d0 & ~reg2dp_d0_op_en;
 assign d1_reg_wr_en = reg_wr_en & select_d1 & ~reg2dp_d1_op_en;

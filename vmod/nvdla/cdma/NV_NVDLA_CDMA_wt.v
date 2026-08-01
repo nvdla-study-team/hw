@@ -8,6 +8,47 @@
 
 // File Name: NV_NVDLA_CDMA_wt.v
 
+// ----------------------------------------------------------------
+// 【机制总览】WT：权重取数通路（外存 → cbuf 权重区，独立于 dat 三通路）
+//
+// 一、三条子流与两种模式
+//   WT  = 权重数据本体（非压缩/压缩都有）
+//   WMB = 压缩模式的位掩码（weight mask bitmap），指示哪些权重非零
+//   WGS = 压缩模式的组尺寸表（每 kernel group 的压缩后字节数），WT/WMB
+//         的取数节奏靠它逐组解出
+//   weight_format 非压缩时只有 WT 流活跃；压缩时三流并发，各有独立的
+//   地址生成器（基址分别取 weight/wmb/wgs 的 addr 寄存器）。
+//
+// 二、两级仲裁合一出 DMA 读口（本模块只占顶层一对 wt2mcif/cvif 口）
+//   L1 WRR（u_wrr_arb）：WMB vs WT，权重来自 S_ARBITER 寄存器
+//   （reg2dp_arb_wmb/arb_weight，权重 0 即禁用该路）；
+//   L2 静态（u_sp_arb）：WGS 恒优先于 WRR 胜者——组尺寸不解出来，
+//   WT/WMB 不知道下一组取多少，故 WGS 饿不得。
+//   两级都带 back-package 暂存：下游反压时已仲出的请求包缓存一拍重放，
+//   期间 gnt_busy 封锁新授权（不丢包、不重排）。
+//   请求包 {src,size,size_out,addr}：src 标记流别，发出时压入 rsp fifo，
+//   回包按 fifo 头 src 分流回 WT/WMB/WGS 各自的数据消费逻辑。
+//
+// 三、cbuf 权重区布局与写口（512b 半 entry 粒度，13bit 半 entry 索引）
+//   WT 数据：从 bank(data_bank+1) 起顺序写，到 weight_bank_end 回绕
+//   ——权重区是数据区之后的环形缓冲；WMB：固定从 bank15 起
+//   （idx 高 4bit 恒 4'hF）。写口三路复用优先级 wt > wmb > flush；
+//   cdma2buf_wt_wr_addr = idx[12:1]、hsel = idx[0]（半 entry 交替）。
+//
+// 四、复位 flush（上电 cbuf 清零的权重侧一半）
+//   复位后 wt_cbuf_flush_idx 从 0 数满 4096 个半 entry（= bank8..15，
+//   地址高位恒 1），以最低优先级写全 0，完成后 dp2reg_wt_flush_done；
+//   与 cvt 侧 dat flush（bank0..7）合起来覆盖整个 cbuf——RAM 无复位，
+//   靠这对 flush 保证上电后读出确定值。走 ng_clk（复位后即跑，不等
+//   op_en 开门控）。
+//
+// 五、记账与 CSC 握手
+//   按 kernel group 记账（status_group_cnt 数到 group 总数为一层完），
+//   每组把 WT/WMB 本组新增的半 entry 增量（fetched_cnt 差分）连同
+//   kernels 数经 cdma2sc_wt_updt 报给 CSC；层间 data_bank/weight_bank
+//   配置变化触发 need_pending（同 dat 侧的清账握手）。四态 FSM 与
+//   dc.v 相同，DONE 等 status 的 fsm_switch 统一切层。
+// ----------------------------------------------------------------
 module NV_NVDLA_CDMA_wt (
    nvdla_core_clk            //|< i
   ,nvdla_core_ng_clk         //|< i
@@ -629,6 +670,9 @@ reg            wt_satisfied;
 ////////////////////////////////////////////////////////////////////////
 // CDMA weight fetching logic FSM                                     //
 ////////////////////////////////////////////////////////////////////////
+// 与 dc.v 同构的四态 FSM（0=IDLE/1=PEND/2=BUSY/3=DONE）。差异点：
+// need_pending 看的是 data_bank/weight_bank 配置是否变化（变了要走
+// CSC 清账）；weight_reuse & skip_weight_rls 时零取数直达 DONE
 
 
 //## fsm (1) output
@@ -5785,6 +5829,10 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  CDMA WT read request arbiter                                      //
 ////////////////////////////////////////////////////////////////////////
+// 仲裁第一级：WMB(req0) vs WT(req1) 的加权轮转（WRR），权重来自
+// S_ARBITER 寄存器。授权后请求包缓存进 arb_wrr_out_package；若下游
+// （第二级仲裁）反压，则把在途包挪进 out_back 暂存并置 gnt_busy 封锁
+// 新授权，恢复后先重放暂存包——保证已授权请求不丢不重排
 
 NV_NVDLA_CDMA_WT_wrr_arb u_wrr_arb (
    .req0                (arb_wrr_in_vld[0])       //|< w
@@ -5904,6 +5952,9 @@ assign arb_wrr_req_package_in_01 = {wt_req_src_d3, wt_req_size_d3, wt_req_size_o
 
 ///////////////////////////// Static Arbiter ////////////////////////////////
 ///////////////////////////// SP Control logic ////////////////////////////////
+// 仲裁第二级：静态优先级，WGS(req0) 恒压过 WRR 胜者(req1)——压缩模式
+// 下 WT/WMB 每组取多少字节都由 WGS 解出的组尺寸决定，WGS 断粮会卡死
+// 整个流水，必须最高优先。back-package 机制同第一级
 
 NV_NVDLA_CDMA_WT_sp_arb u_sp_arb (
    .req0                (arb_sp_in_vld[0])        //|< w
@@ -6358,6 +6409,9 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  CDMA read response connection                                     //
 ////////////////////////////////////////////////////////////////////////
+// rsp 按请求序返回；发请求时压入 rsp fifo 的 src 字段标记这笔属于
+// WT/WMB/WGS 哪条流，回包按 fifo 头 src 分流到对应的 read data 段消费
+// （mask 语义同 dc.v：每拍 2×256b 半字独立有效）
 
 
 // PKT_UNPACK_WIRE( dma_read_data , dma_rd_rsp_ , dma_rd_rsp_pd )
@@ -7287,6 +7341,10 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  weight buffer flushing logic                                      //
 ////////////////////////////////////////////////////////////////////////
+// 上电清零（权重侧一半）：复位后 flush_idx 自增写 4096 个半 entry 的
+// 全 0——地址 {1'b1, idx[11:1]} 即 bank8..15；数满（idx[12] 置 1）停
+// 并报 dp2reg_wt_flush_done。cbuf RAM 无复位，dat 侧（cvt）清 bank0..7
+// 与此互补覆盖全部 16 bank。在写口复用中优先级最低，不挡正常取数
 ////////////////////////////////////////////////////////////////////////
 //  Non-SLCG clock domain                                             //
 ////////////////////////////////////////////////////////////////////////
@@ -7372,6 +7430,10 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  WT and WMB write to convolution buffer                            //
 ////////////////////////////////////////////////////////////////////////
+// 三路复用唯一的 512b 写口，优先级 wt > wmb > flush（wt/wmb 各自攒满
+// 512b 才请求，互斥少冲突）。13bit 半 entry 索引拆分：addr=idx[12:1]、
+// hsel=idx[0]。wt 从 {data_bank+1, 9'b0} 起、到 weight_bank_end 回绕；
+// wmb 高 4bit 恒 4'hF 固定 bank15——与 cbuf 的分区断言互为约束
 always @(
   wt_cbuf_wr_vld_w
   or wmb_cbuf_wr_vld_w
@@ -9385,6 +9447,10 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  status update logic                                               //
 ////////////////////////////////////////////////////////////////////////
+// 逐 kernel group 对账：每组的应取量（非压缩按 byte_per_kernel 算，
+// 压缩由 WGS 解出）与 fetched 计数比较，wt_satisfied（压缩时还要
+// wmb_satisfied）即本组取齐 → status_update 脉冲，组计数 +1，数满
+// group 总数为一层取数完成
 
 always @(
   status_group_cnt
@@ -10165,6 +10231,10 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  CDMA WT communicate to CSC                                        //
 ////////////////////////////////////////////////////////////////////////
+// 每次 status_update 把本组增量报给 CSC：fetched_cnt 与上次快照差分得
+// incr_wt/wmb_entries（半 entry 折 entry），连同本组 kernels 数打 3 拍
+// 出 cdma2sc_wt_updt/kernels/entries/wmb_entries（kernels 高 8bit 恒 0，
+// 单次增量 ≤ 63）。CSC 端据此维护权重区占用副本
 
 always @(
   status_last_group

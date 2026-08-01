@@ -8,6 +8,49 @@
 
 // File Name: NV_NVDLA_CDMA_dc.v
 
+// ----------------------------------------------------------------
+// 【机制总览】DC：直接卷积 feature 取数主干（外存 surface → cbuf entry）
+//
+// 一、基本量纲（贯穿全文件）
+//   atom = 32B（256bit）：地址计数、请求 size、rsp mask、sbuf 端口宽
+//   都以 atom 为单位；surface = C 方向的一个 32B 通道组平面；
+//   entry = cbuf 一行 128B = 4 atom；grain = reg2dp_grains 配的 slice
+//   批量，是向 status 报账（updt）的粒度。
+//
+// 二、请求生成（req 侧，五层嵌套计数器）
+//   batch → channel(surface) → atomic → 地址四级基址（grain/batch/
+//   ch/base，均由 stride 逐级累加，不做乘法）。channel 计数器一次并行
+//   跟踪 1/2/4 个 surface（req_ch_mode：hog/packed_1x1=1、normal=2、
+//   shrink=4，对应 4 套 atomic 计数器轮转 req_atm_sel）；atomic 计数器
+//   把一个 surface 行切成若干笔请求：首笔 size 限 8−addr[2:0]（把突发
+//   对齐到 8-atom=256B 边界），之后每笔最多 8 atom。
+//   限流：cbuf_is_ready = (onfly entry + 本 grain 需求) ≤ free_entries，
+//   不满足则暂停发请求——这是 DC 对 cbuf 空间的唯一背压点。
+//
+// 三、请求打包（dma_rd_req_pd[78:0]）
+//   pd[63:0] = {内部 32B 单位地址, 5'b0}（还原字节地址，天然 32B 对齐）
+//   pd[78:64] = size，【0-based】atom 数（req_atm_size−1），上限 7=8 atom
+//   按 reg2dp_datain_ram_type 静态选 MC 或 CV 口（一层内不换）。发出时
+//   同时把 {ch_idx,size} 压入 rsp fifo 供回包记账。
+//
+// 四、响应消费（rsp 侧）
+//   rsp pd[513:512] = mask[1:0]：mask[0]=低 256b 有效、mask[1]=高 256b
+//   有效（各 1 atom，首尾非对齐拍可能只有一半）。mask[0]→sbuf p0 口、
+//   mask[1]→p1 口，写地址取自 rsp fifo 头部 ch_idx 对应的 4 套地址
+//   计数器（每 surface 独立递增）；mask 位计数攒满该笔 size 后弹 fifo。
+//
+// 五、entry 组装（sbuf 读 → cvt 写）
+//   sbuf 攒够一对 256b（p0+p1 同拍读出拼 512b 半 entry）才发读；写 cvt
+//   的 entry 索引 = idx_base + grain/h/w 三级偏移，其中 w 计数按打包
+//   密度折算（除 8/4/2/1）：C 方向 surface 优先拼满 entry，C 不足时用
+//   相邻 2/4/8 个 w 位置折叠填满；hsel 在两个半 entry 间交替。
+//
+// 六、记账与 updt
+//   req 侧按 grain 预登 onfly entry（发完一个 grain 的请求 +req_entry，
+//   updt 报账后 −），rsp 侧一个 grain 全维度收完（rsp_all_h_reg_en）
+//   把 rsp_entry/rsp_slice 打 3 拍出 dc2status_dat_updt——再经 status
+//   的 9 拍链才到 CSC，全程约 12 拍。
+// ----------------------------------------------------------------
 module NV_NVDLA_CDMA_dc (
    nvdla_core_clk            //|< i
   ,nvdla_core_ng_clk         //|< i
@@ -717,6 +760,11 @@ reg     [33:0] stl_cnt_nxt;
 ////////////////////////////////////////////////////////////////////////
 // CDMA direct convolution data fetching logic FSM                    //
 ////////////////////////////////////////////////////////////////////////
+// 四态主 FSM（与 status.v 的 state 编码一致：0=IDLE/1=PEND/2=BUSY/3=DONE）
+// IDLE→PEND：新层且 CSC 已发 pending（need_pending，须先清账再取数）
+// IDLE→DONE：data_reuse 且上层 skip_data_rls 且模式匹配——数据还在
+//            cbuf 里，本层零取数直接完成
+// BUSY→DONE：fetch_done；DONE→IDLE：status 的 fsm_switch（dat+wt 双完成）
 
 //## fsm (1) output
 
@@ -5903,7 +5951,10 @@ end
 `endif // SPYGLASS_ASSERT_ON
 
 ///////////// channel counter /////////////
-
+// 此处 channel = C 方向的 surface（32B 通道组），不是单通道。req_ch_mode
+// 决定一轮并行取几个 surface：hog/packed_1x1=1、shrink（in16→proc8）=4、
+// 其余（normal/expand）=2；尾轮不足按剩余数。并行数与下方 4 套 atomic
+// 计数器、rsp 侧 4 套 sbuf 地址计数器一一对应
 always @(
   is_hog
   or is_packed_1x1
@@ -6225,7 +6276,11 @@ end
 `endif // SPYGLASS_ASSERT_ON
 
 ///////////// atomic counter /////////////
-
+// 把一个 surface 行（req_atm 个 32B atom）切成多笔总线请求：4 套计数器
+// （req_atm_cnt_0..3）按 req_atm_sel 轮转，正在并行取的每个 surface 各
+// 占一套。单笔 size = min(剩余 atom, 地址窗限)；首笔窗限 = 8−addr[2:0]
+// 把后续突发对齐到 8-atom(256B) 边界，之后恒为 8。req_atm_size_out =
+// size−1 即总线上的 0-based 编码
 always @(
   req_atm_sel
   ) begin
@@ -6828,7 +6883,10 @@ end
 `endif // SPYGLASS_ASSERT_ON
 
 ///////////// address counter /////////////
-
+// 四级基地址流水（全部加法递推，无乘法器）：grain_base（+grain_addr，
+// 一个 grain 的总跨度）→ batch_base（+batch_stride）→ ch_base
+// （+surf_stride，shrink×4/normal×2/hog×1 倍）→ req_addr（atom 递增）。
+// 各级在上级回卷时从上级 inc 值重载，层起点统一取 datain_addr 寄存器
 assign req_addr_ori = {reg2dp_datain_addr_high_0, reg2dp_datain_addr_low_0};
 
 always @(
@@ -7420,6 +7478,8 @@ end
 `endif // SPYGLASS_ASSERT_ON
 
 ///////////// request package /////////////
+// 发请求的闸门：BUSY 态 + 地址流水就绪 + cbuf 空间够（cbuf_is_ready，
+// 见 slices & entries management 段）+ 当前 surface 尚未取完
 assign req_valid_d0 = is_running & req_pre_valid & cbuf_is_ready & ~cur_atm_done;
 
 assign req_valid_d1_w = ~is_running ? 1'b0 :
@@ -7774,6 +7834,9 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  CDMA DC read request interface                                    //
 ////////////////////////////////////////////////////////////////////////
+// 请求出口：按 datain_ram_type 静态分流 MC/CV（valid/ready 用 type 位
+// 互斥门控，另一侧永远无握手）。dma_rd_req_vld 还需 dma_req_fifo_ready
+// ——请求元数据 {ch_idx,size} 同拍压入内部 rsp fifo，fifo 满则请求也停
 
 // rd Channel: Request 
 assign cv_dma_rd_req_vld = dma_rd_req_vld & (dma_rd_req_type == 1'b0);
@@ -7908,6 +7971,9 @@ assign dma_rd_rsp_pd = ({514{mc_dma_rd_rsp_vld}} & mc_dma_rd_rsp_pd)
 
 
 // PKT_PACK_WIRE( dma_read_cmd , dma_rd_req_ , dma_rd_req_pd )
+// 请求包格式：pd[63:0]=字节地址（内部 32B 单位计数左移 5 位还原，恒
+// 32B 对齐）；pd[78:64]=size，0-based 的 32B atom 数（本文件只用低 3
+// 位，0..7 即 1..8 atom = 32..256B）
 assign      dma_rd_req_pd[63:0] =    dma_rd_req_addr[63:0];
 assign      dma_rd_req_pd[78:64] =    dma_rd_req_size[14:0];
 //assign dma_rd_req_vld = dma_req_fifo_ready & req_valid_d1 & cbuf_is_ready;
@@ -7994,6 +8060,11 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  CDMA DC read response connection                                  //
 ////////////////////////////////////////////////////////////////////////
+// rsp 消费与请求记账对账：rsp fifo 头部是当前在收的那笔请求的
+// {ch_idx,size}；每拍按 mask[0]+mask[1] 累计已到 atom 数，攒满 size
+// 弹 fifo 换下一笔。mask 语义：一拍 512b 载 2 个 32B atom，mask[0]=低
+// 256b 有效、mask[1]=高 256b 有效（非对齐首尾拍只有单边）。is_blocking
+// 时整体反压 rsp（下游 sbuf 记账未就绪）
 
 
 
@@ -8986,6 +9057,10 @@ assign ch3_p1_wr_addr = {2'h3, ch3_p1_wr_addr_cnt[0], ch3_p1_wr_addr_cnt[8 -3:1]
 ////////////////////////////////////////////////////////////////////////
 //  Shared buffer write signals                                       //
 ////////////////////////////////////////////////////////////////////////
+// 回数据落 sbuf：mask[0]（低 256b）走 p0 口、mask[1]（高 256b）走 p1
+// 口，写地址按当前 rsp 的 ch_idx 从 4 套 per-surface 地址计数器中选
+// ——rsp 本身按请求序返回，但请求按 surface 轮转发出，故回数据在
+// surface 间交错；按 ch_idx 分拣后每个 surface 在 sbuf 里顺序排布
 always @(
   is_running
   or dma_rd_rsp_vld
@@ -10579,6 +10654,9 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  generate shared buffer rd signals                                 //
 ////////////////////////////////////////////////////////////////////////
+// sbuf 读发起条件：本 w 位置参与拼 entry 的各 surface 计数器都已有货
+// （cur_ch=2 要 ch0&ch1；=3/4 时 ch0ch1 对与 ch2(ch3) 轮流）。p0/p1 同
+// 拍各读 256b 拼 512b 半 entry；rsp_rd_one 表示尾拍只剩单个 256b
 ///////////// read enable signal /////////////
 always @(
   ch0_cnt
@@ -11317,6 +11395,11 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  generate write signal to convertor                                //
 ////////////////////////////////////////////////////////////////////////
+// cbuf 写地址（entry 索引）合成：idx = idx_base + grain 偏移 + h 偏移
+// + w 偏移。w 计数按打包密度折算：is_w_cnt_div8/4/2 时取 rsp_w_cnt 右移
+// 3/2/1 位——C 方向 surface 不足以填满 128B entry 时，用相邻 8/4/2 个
+// w 位置折叠共享一个 entry（C 优先、W 折叠的打包规则）；hsel 用被移出
+// 的低位在两个半 entry（512b）间交替。地址对 data_bank 容量回绕
 
 always @(
   layer_st
@@ -13025,6 +13108,15 @@ assign dc2cvt_dat_wr_data    = cbuf_wr_data_d3;
 ////////////////////////////////////////////////////////////////////////
 //  convolution buffer slices & entries management                    //
 ////////////////////////////////////////////////////////////////////////
+// DC 侧的空间限流与报账：
+// - onfly 记账：发完一个 grain 的全部请求（req_grain_reg_en）时预登
+//   该 grain 的 entry 需求（+req_entry），updt 实际报账后扣回——
+//   onfly = 已承诺未入账的 entry；
+// - cbuf_is_ready = (onfly + 下个 grain 需求) ≤ status 的 free_entries，
+//   打一拍后作为发请求闸门（见 request package 段）；
+// - updt 触发：rsp 侧收满一个 grain 的所有 w/h/ch/batch（rsp_all_h_
+//   reg_en）后，把 rsp_entry/rsp_slice 打 3 拍（d0→d3）出
+//   dc2status_dat_updt/entries/slices，交 status 记账并转发 CSC
 ///////////// calculate onfly slices and entries /////////////
 
 always @(

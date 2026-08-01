@@ -8,6 +8,23 @@
 
 // File Name: NV_NVDLA_CDMA_shared_buffer.v
 
+// ----------------------------------------------------------------
+// 【机制总览】shared buffer：dc/wg/img 三通路分时复用的行缓冲 SRAM
+//
+// 物理：16 × nv_ram_rws_16x256（16 深 × 256bit），合计 256 地址 × 256b
+// = 8KB。逻辑口：p0/p1 各一读一写（8bit 地址 + 256b 数据）×三客户端
+// = 6 写 6 读。地址映射：addr[7:4] 选 16 只 RAM 之一（bsel）、addr[3:0]
+// 是 RAM 内深度——连续地址每 16 个换一只 RAM，p0/p1 用各自地址段错开，
+// 使同拍的 p0 写、p1 写、p0 读、p1 读落在不同 RAM 上（每只 RAM 仍是
+// 一读一写口）。
+//
+// 复用方式与 dma_mux 同一套前提：三客户端按层互斥，故全部是 OR-mux
+// （en 与 bsel 译码相与得 per-RAM one-hot sel，addr/data 掩码或合并），
+// 【无仲裁无反压】；活跃客户端由 CDMA 顶层的 SLCG 交叉门控保证唯一。
+// 读通路：RAM dout（1 拍）→ stage1 按寄存的 bsel 选 RAM → stage2 →
+// 输出寄存，共 3 拍固定延迟——dc/wg/img 内部把 sbuf 读控制打 3 拍
+// （d0..d3）与之对齐后送 cvt。
+// ----------------------------------------------------------------
 module NV_NVDLA_CDMA_shared_buffer (
    nvdla_core_clk      //|< i
   ,nvdla_core_rstn     //|< i
@@ -530,6 +547,8 @@ reg          wg2sbuf_p1_wr_sel_15;
 // Input port to RAMS                                                 //\n";
 ////////////////////////////////////////////////////////////////////////\n";
 
+// 写侧：bsel=addr[7:4] 译码 16 选 1；下面 16 组 × 6 客户端的 sel 逻辑
+// 为机械重复，看 _00 一组即可
 assign dc2sbuf_p0_wr_bsel = dc2sbuf_p0_wr_addr[7:4];
 assign dc2sbuf_p1_wr_bsel = dc2sbuf_p1_wr_addr[7:4];
 

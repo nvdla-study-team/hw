@@ -8,6 +8,32 @@
 
 // File Name: NV_NVDLA_CDMA_cvt.v
 
+// ----------------------------------------------------------------
+// 【机制总览】CVT：cbuf 数据口前的精度转换级（dc|wg|img 三路汇合点）
+//
+// 一、数据通路与 64 cell 阵列
+//   三路写流互斥汇合（无仲裁，同 dma_mux 的前提）后拆成 64 个 16bit
+//   元素，交 64 只 HLS 生成的 CVT_cell（u_cell_0..63，跑独立门控的
+//   nvdla_hls_clk 域）逐元素算：out = (op0 − op1) × scale >> truncate
+//   （带饱和）。op0 = 输入元素（int8 按 uint 标志决定是否符号扩展成
+//   17bit）；op1 = IMG 路的 mean 数据拍或 D_CVT 的 offset（cvt_wr_mean
+//   逐拍选择）；scale/truncate 来自 D_CVT 寄存器。
+//   fp16 输入时旁路做 NaN/Inf 计数（dp2reg_nan/inf_data_num）。
+//
+// 二、bypass 与流水对齐
+//   cvt_en=0 时数据走 1 拍捷径（d1），=1 时走 cell 的 5 拍路径（d5）；
+//   控制信号（vld/addr/hsel/info）两套延迟并行，末级按 cvt_en 选源
+//   ——cfg_cvt_en 是同一位的 6 份扇出复制，不是延迟链。int8 输出模式
+//   64 cell 只产 512b，用 hold 寄存器按行奇偶攒/复制成 1024b 半字。
+//   末级还按 IMG 送来的 pad_mask 逐字节用 pad_value 覆盖（pad 像素
+//   不做转换，直接填充值）。
+//
+// 三、上电 flush（数据侧一半，与 wt.v 的 bank8..15 flush 互补）
+//   复位后 dat_cbuf_flush_idx 数满 4096 个半 entry：addr=idx[12:1]
+//   （0..2047 entry 即 bank0..7）、hsel={idx[0],~idx[0]} 两半交替，
+//   写全 0；数满报 dp2reg_dat_flush_done。flush 与正常输出复用同一
+//   cdma2buf_dat_wr 口，flush 期间层尚未启动，无冲突。
+// ----------------------------------------------------------------
 module NV_NVDLA_CDMA_cvt (
    nvdla_core_clk          //|< i
   ,nvdla_core_rstn         //|< i
@@ -4548,6 +4574,10 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  generate input signals for convertor cells                        //
 ////////////////////////////////////////////////////////////////////////
+// 元素拆分与算子准备：op0 按 in_precision 拆 8b/16b 并做符号扩展
+// （uint 标志压掉符号位）；op1 = mean 拍取 mean 数据、否则取 cfg_offset
+// （见下方 oprand_1_*_ori 的选择）；int8 输入时两个 8b 元素共享一只
+// cell 的两拍
 
 always @(
   cvt_wr_data_d1
@@ -6377,6 +6407,9 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  instance of convert cells                                         //
 ////////////////////////////////////////////////////////////////////////
+// 64 只同构 cell，全部跑 nvdla_hls_clk（u_slcg_hls 门控：cvt_en=0 时
+// 整个阵列断钟，bypass 路不受影响）。cell 内部为 Catapult HLS 产物，
+// 端口语义见 NV_NVDLA_CDMA_CVT_cell.v 文件头
 
 
 always @(
@@ -8116,6 +8149,9 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  stage 2: pipeline to match latency of conver cells                //
 ////////////////////////////////////////////////////////////////////////
+// 控制信号（vld/addr/hsel/info/pad_mask 等）打 d1..d5 两套深度：cell
+// 路径取 d5 与其 5 拍算力延迟对齐，bypass 路径取 d1；末级 *_bp 信号
+// 按 cvt_en 二选一——数据与控制在出口重新同拍
 
 always @(posedge nvdla_core_clk or negedge nvdla_core_rstn) begin
   if (!nvdla_core_rstn) begin
@@ -10069,6 +10105,11 @@ always @(posedge nvdla_core_clk) begin
 end
 
 //////// output regiseters ////////
+// bypass/cell 数据合流的真正逻辑在此（文件头 wire 区只是声明）：
+// - bypass：d1 拍原数据直通，sel_half 处理只写半 entry 的情形；
+// - cell：16b 输出直接 1024b；8b 输出只有 512b，用 hold 寄存器按行
+//   奇偶拼/复制到两半；
+// - cvt_out_data_mix 按 cvt_en 终选，再经 pad_mask 逐字节覆盖 pad_value
 
 assign cvt_data_bypass_hi = cvt_bypass_sel_half_d1 ? cvt_wr_data_d1[511:0] : cvt_wr_data_d1[1023:512];
 assign cvt_data_bypass_lo = cvt_wr_data_d1[511:0];
@@ -10922,6 +10963,9 @@ end
 ////////////////////////////////////////////////////////////////////////
 //  Data buffer flush logic                                           //
 ////////////////////////////////////////////////////////////////////////
+// 上电清零计数器（ng_clk，复位后立即自跑）：13bit 半 entry 索引 0..4095
+// 覆盖 bank0..7；idx[12] 置 1 即停并锁存 flush_done。flush 写在输出段
+// 与正常 cvt 输出复用（flush_vld 直接顶 cvt_out_vld），数据恒 0
 
 always @(
   dat_cbuf_flush_idx

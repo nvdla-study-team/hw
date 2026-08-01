@@ -8,6 +8,38 @@
 
 // File Name: NV_NVDLA_cdma.v
 
+// ----------------------------------------------------------------
+// 【机制总览】CDMA：卷积输入取数引擎（外存 → cbuf 的唯一写入方）
+//
+// 一、四条子通路，同一时刻只有一条数据通路活跃（按层配置互斥）
+//   - DC (u_dc)  ：直接卷积 feature 数据取数
+//   - IMG(u_img) ：图像输入（pitch-linear 像素格式）取数，另带 mean 减除数据
+//   - WG (u_wg)  ：Winograd 卷积数据取数（含 PRA 预变换所需的边界处理）
+//   - WT (u_wt)  ：权重取数（与上面三条"数据"通路并行工作，独立出 cbuf 写口）
+//   DC/WG/IMG 三选一由 reg2dp_conv_mode/datain_format 决定；三者共享
+//   u_shared_buffer（2 端口 SRAM 汇聚站）做行缓冲/重排。
+//
+// 二、数据流（dat 侧）：dc|wg|img → u_dma_mux（对 MCIF/CVIF 合一出口）
+//   取回的数据 → 各自重排 → *2cvt_dat_wr_* → u_cvt（精度转换/均值减除/
+//   pad 填充，int8/int16/fp16 → cbuf 存储格式）→ cdma2buf_dat_wr_*（1024bit，
+//   2×512bit 半字 hsel）写入 cbuf。wt 侧独立：u_wt 直接出
+//   cdma2buf_wt_wr_*（512bit）不过 cvt/dma_mux。
+//   注意：对 MCIF/CVIF 只有两对读口——dat 口（三客户端经 dma_mux 合一）
+//   和 wt 口（u_wt 独占），故 CDMA 顶层共 4 组 rd_req/rd_rsp 接口。
+//
+// 三、记账与握手（u_status + 与 CSC 的 update 环）
+//   dc/wg/img 写入若干 entry 后向 u_status 报增量（*2status_dat_updt），
+//   u_status 维护 cbuf 数据区占用（valid_slices/free_entries/wr_idx 回供
+//   DMA 判断可写空间）；CSC 消费后经 sc2cdma_*_updt 归还释放量。
+//   一层完成：dat 与 wt 两侧都 done 后 u_status 发 status2dma_fsm_switch
+//   统一切层，并出 done 中断（cdma_dat2glb/cdma_wt2glb_done_intr_pd）。
+//
+// 四、时钟门控分组（SLCG 每域一只，共 8 组 slcg_op_en[7:0]）
+//   wt/dc/wg/img/mux/cvt/hls(cvt 内 HLS 细胞)/buffer 各自独立门控；
+//   dc、wg、img 互相之间还有交叉门控信号（slcg_*_gate_*：活跃通路把
+//   另两条闲置通路的时钟关掉，文件尾断言保证三者互斥）。regfile 与
+//   status 始终用未门控的 nvdla_core_clk（CSB 访问和记账不能停）。
+// ----------------------------------------------------------------
 module NV_NVDLA_cdma (
    cdma_dat2cvif_rd_req_ready    //|< i
   ,cdma_dat2mcif_rd_req_ready    //|< i
@@ -380,6 +412,8 @@ wire    [1:0] wt2status_state;
 //==========================================================
 // Regfile
 //==========================================================
+// CSB 寄存器组：ping-pong 双组配置（producer/consumer），reg2dp_* 广播到
+// 各子模块，dp2reg_* 收回状态/性能计数；dp2reg_done 驱动 consumer 组翻转
 NV_NVDLA_CDMA_regfile u_regfile (
    .nvdla_core_clk                (nvdla_core_clk)                  //|< i
   ,.nvdla_core_rstn               (nvdla_core_rstn)                 //|< i
@@ -482,6 +516,9 @@ NV_NVDLA_CDMA_regfile u_regfile (
 //==========================================================
 // Weight DMA
 //==========================================================
+// 权重通路：独占 wt2mcif/wt2cvif 读口与 cdma2buf_wt_wr 写口（512bit，
+// 不经 cvt 转换）；压缩模式下额外取 WMB/WGS，向 CSC 报 kernels/
+// wt_entries/wmb_entries 三种记账。与 dat 侧仅在 fsm_switch 处同步
 NV_NVDLA_CDMA_wt u_wt (
    .nvdla_core_clk                (nvdla_op_gated_clk_wt)           //|< w
   ,.nvdla_core_rstn               (nvdla_core_rstn)                 //|< i
@@ -545,6 +582,9 @@ NV_NVDLA_CDMA_wt u_wt (
   );
 
 //-------------- SLCG for weight DMA --------------//
+// SLCG 统一模式（下同）：3 个使能源相与后门控时钟——src_0 接本域
+// slcg_op_en[n]（regfile 按层配置给出），src_1/2 接交叉门控（无则 tie 1）；
+// tmc2slcg_disable_clock_gating/clk_ovr 可全局强制不门控
 NV_NVDLA_CDMA_slcg u_slcg_wt (
    .dla_clk_ovr_on_sync           (dla_clk_ovr_on_sync)             //|< i
   ,.global_clk_ovr_on_sync        (global_clk_ovr_on_sync)          //|< i
@@ -560,6 +600,9 @@ NV_NVDLA_CDMA_slcg u_slcg_wt (
 //==========================================================
 // Direct convolution DMA
 //==========================================================
+// DC 通路：feature 数据（W×H×C surface 格式）取数，经 shared_buffer 两个
+// 端口做 slice 重排后送 cvt（512bit + hsel 半字使能）；依据 status 回供的
+// free_entries/wr_idx 决定发多少读请求、写到 cbuf 哪个 entry
 NV_NVDLA_CDMA_dc u_dc (
    .nvdla_core_clk                (nvdla_op_gated_clk_dc)           //|< w
   ,.nvdla_core_rstn               (nvdla_core_rstn)                 //|< i
@@ -648,6 +691,8 @@ NV_NVDLA_CDMA_slcg u_slcg_dc (
 //==========================================================
 // Winograd convolution DMA
 //==========================================================
+// WG 通路：Winograd 模式取数，比 DC 多做 pad_left/right/top/bottom 边界
+// 填充（pad_value）与 x/y stride 对齐，为 CMAC 的 PRA 预变换准备 4x4 tile
 NV_NVDLA_CDMA_wg u_wg (
    .nvdla_core_clk                (nvdla_op_gated_clk_wg)           //|< w
   ,.nvdla_core_rstn               (nvdla_core_rstn)                 //|< i
@@ -740,6 +785,9 @@ NV_NVDLA_CDMA_slcg u_slcg_wg (
 //==========================================================
 // Image convolution DMA
 //==========================================================
+// IMG 通路：第一层图像输入（RGB/YUV 多种 pixel_format），做像素重映射与
+// 通道扩展；输出比 DC/WG 宽一倍（1024bit）且带 mean 数据总线与 pad_mask
+// （逐像素标记 pad 位置，供 cvt 决定该字节用 pad_value 还是做均值减除）
 NV_NVDLA_CDMA_img u_img (
    .nvdla_core_clk                (nvdla_op_gated_clk_img)          //|< w
   ,.nvdla_core_rstn               (nvdla_core_rstn)                 //|< i
@@ -843,6 +891,9 @@ NV_NVDLA_CDMA_slcg u_slcg_img (
 //==========================================================
 // DMA mux
 //==========================================================
+// dat 侧三客户端（dc/wg/img）合一：无仲裁器，req 方向按位或直接汇合
+// （依赖三通路层内互斥，断言兜底），rsp 方向按寄存的客户端标志分流回
+// 发起方（详见该文件注释）。mux 的意义在于顶层只占一对 dat 读口
 NV_NVDLA_CDMA_dma_mux u_dma_mux (
    .nvdla_core_clk                (nvdla_op_gated_clk_mux)          //|< w
   ,.nvdla_core_rstn               (nvdla_core_rstn)                 //|< i
@@ -912,6 +963,9 @@ NV_NVDLA_CDMA_slcg u_slcg_mux (
 //==========================================================
 // DMA data convertor
 //==========================================================
+// 精度/格式转换级：dc|wg|img 三路写流在此汇合（互斥，无仲裁），按
+// cvt_en/scale/offset/truncate 做定点缩放截断，IMG 路再按 pad_mask 选择
+// pad_value 或均值减除；输出统一 1024bit + 2bit hsel 写 cbuf 数据区
 NV_NVDLA_CDMA_cvt u_cvt (
    .nvdla_core_clk                (nvdla_op_gated_clk_cvt)          //|< w
   ,.nvdla_core_rstn               (nvdla_core_rstn)                 //|< i
@@ -983,6 +1037,9 @@ NV_NVDLA_CDMA_slcg u_slcg_hls (
 //==========================================================
 // Shared buffer
 //==========================================================
+// 三通路共享的行缓冲 SRAM（p0/p1 两个 256bit 读写端口，256 深）：
+// dc/wg/img 谁活跃谁用（三套端口在内部一对一复用到同一 RAM），
+// 用于把乱序/窄的 DMA 回数据攒成整 slice 再送 cvt
 NV_NVDLA_CDMA_shared_buffer u_shared_buffer (
    .nvdla_core_clk                (nvdla_op_gated_clk_buffer)       //|< w
   ,.nvdla_core_rstn               (nvdla_core_rstn)                 //|< i
@@ -1041,6 +1098,10 @@ NV_NVDLA_CDMA_slcg u_slcg_buffer (
 //==========================================================
 // CDMA status controller
 //==========================================================
+// 记账与切层中枢：汇聚 dc/wg/img 的写入增量与 CSC 的释放量维护数据区
+// 占用（free_entries/valid_slices/wr_idx 回供各 DMA）；等 dat+wt 双侧
+// done 才发 fsm_switch/dp2reg_done/done 中断；并处理 CSC 发起的
+// pending req/ack 层间握手（详见该文件注释）
 NV_NVDLA_CDMA_status u_status (
    .nvdla_core_clk                (nvdla_core_clk)                  //|< i
   ,.nvdla_core_rstn               (nvdla_core_rstn)                 //|< i
