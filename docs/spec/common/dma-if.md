@@ -67,6 +67,28 @@ cdp2cvif/cvif2cdp）：
 客户端可用 rd_rsp_ready 回压（cdp 把响应先落进本地 latency FIFO，写口 prdy 就是
 rd_rsp_ready 的源头，eg.v:325-335）。
 
+> **勘误（DV 实证 + 生成/消费两侧实读，推翻上表"出现 2'b01/2'b10"中的 2'b10
+> 部分）**：**mask 只有 2'b11 / 2'b01 两种取值，2'b10 永不出现；首块永远落首拍
+> 低 256b，与 addr[5]（64B 对齐与否）无关。** 依据：
+>
+> - **生成侧**：mcif 读出口对每个 beat 只按"是否奇数尾块"二选一——
+>   `dma0_mask = dma0_is_last_odd ? 2'b01 : 2'b11`
+>   （vmod/nvdla/nocif/NV_NVDLA_MCIF_READ_eg.v:1095；cvif 同构）。AXI 数据的
+>   首尾去半与 swizzle 交换（swizzle = 起始 32B 块偏移的奇偶，
+>   `out_swizzle = (stt_offset[0]==1'b1)`，NV_NVDLA_MCIF_READ_IG_bpt.v:387）
+>   都发生在写入两个 256b 重排 FIFO **之前**（eg.v:1051-1057：数据与写使能按
+>   swizzle 交叉入队），所以客户端出口的 beat 流已按请求块序**紧凑重排**——
+>   非对齐首块不会以 2'b10 形式出现，只会被并进满拍。
+> - **消费侧与之自洽**：cdma dc 按 `mask[0]+mask[1]` popcount 计块
+>   （NV_NVDLA_CDMA_dc.v:8015），mask[0] 固定写低 256b 缓冲、mask[1] 固定写
+>   高 256b 且地址顺序递增（:8995、:9004）；被注释掉的备选地址逻辑
+>   （:9042-9049，按 `~mask[0]` 调路）说明 2'b10 情形曾被考虑后放弃。
+>   cdma wt 同样假设紧凑（NV_NVDLA_CDMA_wt.v:6377、:6762
+>   `mask[1] ? p1 : p0` 取尾块）。
+> - **对 UT**：mask=2'b10 属**非法输入**，DUT 消费逻辑不支持（静默错位、无断言
+>   报错），dma_slave_agent 不得生成；合法模式是"中间拍恒 2'b11、奇数块数请求的
+>   最后一拍 2'b01"。9 节 checklist 的 mask 测试点按此收窄。
+
 ## 4. credit（latency FIFO 信用）机制
 
 防死锁设计：mcif 在**发射读请求前**就确认客户端有地方收数据，避免 AXI 读数据无处安放
@@ -91,6 +113,19 @@ rd_rsp_ready 的源头，eg.v:325-335）。
 对 UT 的含义：**pop 是"客户端从自家 latency FIFO 消费了一拍"的事后通告，不是握手**；
 从设备侧只需直通计数（发出的 beat 数 − 收到的 pop 数 ≤ 客户端 FIFO 深度），用于校验
 客户端不多还、不少还。
+
+> **勘误（修正"所有客户端都有 pop"的印象）**：CDMA 的 4 路读客户端（cdma_dat /
+> cdma_wt × mcif/cvif）**不参与本节的 latency-FIFO credit 机制**——这 4 路根本没有
+> rd_cdt_lat_fifo_pop 端口。mcif 侧对应两个 bpt 的 pop 输入拴 0、
+> `tieoff_lat_fifo_depth = 8'd0`（vmod/nvdla/nocif/NV_NVDLA_MCIF_READ_ig.v:321-329
+> cdma_dat、:334-342 cdma_wt；cvif 侧 NV_NVDLA_CVIF_READ_ig.v:321-329、:334-342 同构）。
+> bpt 内 depth=0 时 `lat_fifo_stall_enable = (tieoff_lat_fifo_depth!=0)` 为 0：信用
+> 占用不再累加（`lat_count_inc` 被门死）、`req_enable` 恒真，扣发逻辑完全关闭
+> （NV_NVDLA_MCIF_READ_IG_bpt.v:228、:236、:337；NV_NVDLA_CVIF_READ_IG_bpt.v 同构
+> 同行号，均已实读核对）。CDMA 靠 rd_rsp_ready 反压 + 内部 shared_buffer 承接在途
+> 数据自保（见 [units/cdma-cbuf.md](../units/cdma-cbuf.md) 2.2/4.2 节）。对 UT 的
+> 含义：给 cdma 挂 dma_slave_agent 时不存在 pop 事件，上文"credit 直通计数"与 9 节
+> "credit 守恒"测试点对这 4 路不适用。
 
 ## 5. 写通道
 

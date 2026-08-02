@@ -63,3 +63,4 @@
 |---|---|
 | 2026-07-22 | harness 搭建；构建/仿真链路实测跑通（sanity0 PASSED）；路线图定稿 |
 | 2026-07-27 | 阶段 2 完成（DV/DE/DOC 三角色并行）：docs/spec/ 两份公共协议 spec；vmod 核心集 299 行中文注释（重建 diff 仅注释、sanity0 PASSED）；verif/ut/ UVM 平台 + csb_master 冒烟/随机全绿。实测新发现：csb_master 跨扇出口不保序、扇出口仅 1 级保持寄存器、写命令包 [77]=require_ack |
+| 2026-08-01 | 阶段 3.1 进行中（Wave 1 完成、Wave 2 推进）：docs/spec/units/cdma-cbuf.md 草稿 + §6 checklist 初版（T0 六项核销）；dma-if.md 两条勘误（cdma 无 credit、响应 mask 仅 2'b11/2'b01）；cdma/cbuf 5 文件中文注释；verif/ut/cdma_cbuf 骨架 + T0 寄存器面全绿。实证发现：复位 flush 全 0（dat/wt 各 4096 拍、与 D_BANK 无关）、updt 增量公式与 9 拍延迟、dma_mux 非仲裁、fetch_grain 受 line_packed 门控、spec/manual 无 CDMA 定义 |
