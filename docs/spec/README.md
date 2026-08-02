@@ -21,6 +21,14 @@ verif/ut/ 单元验证（Unit Test, UT）共同消费。**所有论断以 vmod/ 
 单元 spec 与公共协议 spec 的分界：**凡是两个以上单元以相同形状出现的接口，写进 common/，
 units/ 里只引用不复述**（例如各引擎的 csb2xx 口、xx2mcif 口都指向 common/ 两篇）。
 
+## units/ 下的两种文档类型
+
+除四要素 spec 外，units/ 另设**验证方案书**（verification plan）文档类型，用于多单元
+联合 UT（如 `csc-cmac-cacc.md`）：一次验证跨越多个单元时，先于逐单元 spec 产出一份
+面向验证的整体方案。验证方案书固定四部分结构：**① DUT 架构与代码列表 ② feature
+功能特性清单 ③ 测试点 ④ 验证框架**，题头显式标注"文档类型：验证方案书"以与四要素
+spec 区分；file:line 引用规则与行文约定与 spec 相同。
+
 ## Spec 编写模板（四要素，缺一不可）
 
 每篇 spec 必须包含以下四个部分，标题措辞可调整，内容不可省略：

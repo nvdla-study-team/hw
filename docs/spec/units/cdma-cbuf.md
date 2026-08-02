@@ -51,6 +51,318 @@ dc/wg/img 互斥由 SLCG 门控信号互斥断言兜底（NV_NVDLA_cdma.v:1180�
 - 空间/合法性约束（哪个 bank 属 data、哪个属 weight、bank15 归 wmb）是 CDMA 配置
   与 CBUF 断言共同表达的一个整体（4.4 节断言清单）。
 
+### 1.4 CDMA-CBUF 端到端数据流
+
+这一节先不按 RTL 文件拆开，而是跟随一层卷积的数据，从外存一直走到 CSC。后续
+第 2～4 节再分别展开接口、寄存器和内部机制。
+
+#### 1.4.1 软件先准备什么
+
+一层启动前，软件/编译器需要确定并配置：
+
+- 输入 feature/image 的外存布局、基址、尺寸、stride 和输入精度；
+- weight 的 kernel 排列、基址、每 kernel 字节数和 kernel 总数；
+- 是否使用 Winograd、image input 或普通 direct convolution 数据路径；
+- CBUF 中 data bank 与 weight bank 的数量；
+- 输入精度到处理精度之间的 `offset/scale/truncate`；
+- 压缩权重模式下的 WT、WMB、WGS 三个外存区域。
+
+压缩权重不是 `NV_NVDLA_CDMA_wt` 运行时产生的。软件已经把原始稠密权重：
+
+```text
+[3, 0, 0, -2, 0, 5, 0, 0]
+```
+
+预先编排为：
+
+```text
+WT  = [3, -2, 5]                非零权重数值
+WMB = [1, 0, 0, 1, 0, 1, 0, 0] 原始位置是否非零
+WGS = 当前kernel group压缩后的WT字节数
+```
+
+这里的“软件准备输入布局”不表示输入一定由 CPU 搬运；输入也可能是上一硬件层写回的
+结果。关键是生产者和 CDMA 必须遵循同一 tensor/weight 内存格式。
+
+复位释放后，CDMA 先用 dat/wt 两个写口并行清零整个 CBUF，软件应等待
+`S_CBUF_FLUSH_STATUS.flush_done=1`，再配置 D 组寄存器并置 `D_OP_ENABLE.op_en`。
+
+#### 1.4.2 一层启动后的两条并行主线
+
+一层开始后，CDMA 同时运行两条相对独立的预取主线：
+
+```text
+Data主线：   DC / IMG / WG 三选一 -> shared_buffer -> CVT -> CBUF data区
+Weight主线： WT（压缩时含WMB/WGS）             -> CBUF weight区/WMB区
+```
+
+两条主线拥有独立的外部 DMA 读接口：`cdma_dat2*` 和 `cdma_wt2*`，因此 Data 与
+Weight 可以同时向 MCIF/CVIF 发请求、同时接收响应、写不同 CBUF bank。它们不是
+“先把 Data 全搬完，再搬 Weight”。
+
+Data 主线内部则是三选一：
+
+```text
+普通feature map + direct convolution -> DC
+原始pixel/image输入                -> IMG
+Winograd模式的feature/tile组织      -> WG
+```
+
+同一层不会同时运行 DC、IMG、WG。`dma_mux` 依赖这个互斥条件，把三套内部端口 OR/mux
+成一个对外 Data DMA 端口；它不是在三路之间做动态公平仲裁。
+
+整体关系如下：
+
+```text
+                           +-> DC  --+
+DRAM/CVSRAM -> Data DMA ---+-> IMG --+-> shared_buffer -> CVT -> CBUF Data banks --+
+                           +-> WG  --+                                           |
+                                                                                 +-> CSC -> CMAC
+DRAM/CVSRAM -> Weight DMA -> WT/WMB pack ----------> CBUF WT banks / bank15 -----+
+                           `-> WGS FIFO -> group完成判断
+```
+
+#### 1.4.3 Data 主线：外存到 shared_buffer
+
+DC/IMG/WG 根据 tensor 尺寸、stride、surface/tile 和当前 CBUF 空闲量生成 DMA 请求。
+外部请求的基本颗粒是 32B atom：
+
+```text
+request pd = {size[14:0], addr[63:0]}
+addr       = 32B对齐地址
+size       = atom数 - 1
+```
+
+MCIF/CVIF 返回：
+
+```text
+response pd = {mask[1:0], data[511:0]}
+
+mask[0] -> 低256bit atom有效
+mask[1] -> 高256bit atom有效
+```
+
+有效的 256-bit atom 先写入 8KB `NV_NVDLA_CDMA_shared_buffer`。它是 DMA response
+与下游格式整理之间的临时行缓冲，用来吸收返回抖动，并让 DC/IMG/WG 按 CBUF entry、
+channel surface 或 tile 需要的次序重新读取。它不是最终 CBUF，也不被 CSC 访问。
+
+三种 Data 客户端从 shared buffer 读出后的职责不同：
+
+| 路径 | shared buffer 之后主要做什么 | 送入 CVT 的宽度 |
+|---|---|---:|
+| DC | 按普通 feature surface/entry 计数读取，两个 256-bit 端口拼成半 entry | 512 bit |
+| WG | 按 Winograd 扩展尺寸和 tile/line 规则读取、组织半 entry | 512 bit |
+| IMG | 解包 packed/planar pixel，处理 YUV/RGB 分量位置，生成 data/mean/pad mask | 1024 bit |
+
+DC 中最直接的数据拼接是：
+
+```verilog
+cbuf_wr_data_d3 <= {dc2sbuf_p1_rd_data, dc2sbuf_p0_rd_data};
+```
+
+也就是两个 256-bit atom 形成一个 512-bit 半 entry。IMG 的 `IMG_pack` 比 DC 多一层
+像素格式重排，但三路最终都进入同一个 `NV_NVDLA_CDMA_cvt`，不会直接写 CBUF。
+
+#### 1.4.4 CVT：逐元素数值预处理和 CBUF 打包
+
+CVT 先选择当前有效的 DC/WG/IMG 输入，然后对 activation 做可选的逐元素预处理。
+整数输入且 `cvt_en=1` 时，64 个并行 HLS cell 执行：
+
+```text
+y = SAT_proc_precision(((x - offset_or_mean) * scale) >> truncate)
+```
+
+- `offset_or_mean`：普通 feature 使用 `D_CVT_OFFSET`；IMG mean 拍使用对应 pixel mean，
+  二者是二选一；
+- `scale`：把输入整数映射到本层 CMAC 使用的量化尺度；
+- `truncate`：算术右移，去除定点乘数的小数位并限制幅度；
+- `SAT`：按 INT8/INT16 目标范围饱和，避免高位截断回绕。
+
+精度变化对应的数据宽度变化为：
+
+```text
+INT8  -> INT16/FP16：expand，一个元素由8bit变16bit
+INT16 -> INT8：      shrink，一个元素由16bit变8bit
+同位宽：             normal
+```
+
+FP16 输入只能输出 FP16，cell 内原样传递 FP16 bit pattern；顶层另外做 NaN/Inf 统计和
+可选 NaN-to-zero。FP16 输入不会先转成整数再执行上述定点公式。`cvt_en=0` 时走 bypass，
+且输入精度必须等于处理精度。
+
+CVT 末级把有效结果和 padding 值组合成 CBUF 写口格式：
+
+```text
+cdma2buf_dat_wr_data[1023:0]  一个128B entry的数据总线
+cdma2buf_dat_wr_hsel[1:0]     low/high 512bit分别是否写入
+cdma2buf_dat_wr_addr[11:0]    {bank, bank内entry}
+```
+
+CVT 的“重排”只包含精度宽度变化、半 entry 攒包和 CBUF entry 打包。它不会根据
+`R/S` 展开所有滑窗，也不会决定某个 activation 与哪个 kernel 相乘；这一步在 CSC。
+
+#### 1.4.5 Weight 主线：非压缩和压缩模式
+
+Weight 主线不经过 Data `dma_mux`、shared buffer 或 CVT。它有自己的 DMA 端口、请求
+信息 FIFO、response 拼接寄存器和 CBUF 写指针。
+
+非压缩模式只有 WT：
+
+```text
+外存稠密WT
+ -> Weight DMA按32B atom读取
+ -> 连续两个atom拼成512bit半entry
+ -> FP16时检测NaN/Inf并可选NaN-to-zero
+ -> 写CBUF weight banks
+```
+
+压缩模式同时管理三条内部流：
+
+| 流 | 内容 | response 后的变化 | 最终去向 |
+|---|---|---|---|
+| WT | 已删除零的非零 weight 数值 | 256-bit atom 连续拼成 512-bit | CBUF weight banks |
+| WMB | 每个原始 weight 位置的非零 bitmap | 256-bit atom 连续拼成 512-bit | CBUF bank15 |
+| WGS | 每个 kernel group 压缩后的 WT byte 数 | 一个 256-bit atom 拆成 8 个 32-bit size | WT 内部 WGS FIFO |
+
+三套请求生成器可以同时提出请求，但对外只有一条 Weight DMA request，因此内部先让
+WT/WMB 做加权轮转，再让 WGS 以固定高优先级参与第二级选择。WGS 优先是因为 CDMA
+必须先知道当前 group 需要多少压缩 WT byte，才能判断这一组何时取齐。
+
+每发出一笔 WT/WMB/WGS 请求，模块把 `{src,size}` 压入 response-info FIFO；回包按
+FIFO 头的 `src` 分流。压缩模式下当前 kernel group 必须同时满足：
+
+```text
+已写CBUF的WT byte >= WGS给出的累计WT门槛
+并且
+已写CBUF的WMB bit >= 当前group对应的原始权重位置数
+```
+
+只有 `wt_satisfied & wmb_satisfied` 才向 CSC 通告这一组可用。WGS 不进入 CBUF，
+也不参与 CMAC 计算；它只是 CDMA_wt 的变长流边界信息。
+
+#### 1.4.6 CBUF 中最终存放什么
+
+本配置的 CBUF 是 16 bank × 32KB = 512KB。每 bank 有 256 个 128B entry；一个 entry
+由低、高两个 512-bit column 组成：
+
+```text
+addr[11:8] = bank
+addr[7:0]  = bank内entry
+entry      = {column1[511:0], column0[511:0]} = 1024bit
+```
+
+bank 分区不是 CBUF 自己配置的，而是 CDMA/软件共同遵守的空间合同：
+
+```text
+低编号bank                              高编号bank
++----------------------+----------------------+-------------+
+| Data banks           | Weight banks         | WMB bank     |
+| bank0...              | 紧跟Data区之后       | bank15      |
++----------------------+----------------------+-------------+
+```
+
+例如压缩模式配置 8 个 data bank、7 个 weight bank：
+
+```text
+bank0  ~ bank7  : activation/Data
+bank8  ~ bank14 : 非零WT数值
+bank15          : WMB bitmap
+```
+
+非压缩模式没有 WMB，bank15 可以作为普通 weight bank。WGS 在 CDMA_wt 内部 FIFO，
+任何模式下都不占 CBUF bank。
+
+Data 与 Weight 写口可以同拍工作，只要不访问同一 bank。CBUF 写口没有 ready，不能
+临时拒绝 CDMA，所以 CDMA 必须在发请求前根据账本保证有空间。
+
+#### 1.4.7 CSC 怎样从 CBUF 取走数据
+
+CDMA 写完一批可消费数据后，不直接把数据推给 CMAC，而是通过 update 接口通知 CSC：
+
+```text
+Data update  : 新增多少 entries、slices
+Weight update: 新增多少 kernels、WT entries、WMB entries
+```
+
+CSC 的 data loader 和 weight loader 再主动向 CBUF 发读请求：
+
+```text
+sc2buf_dat_rd_* -> activation entry
+sc2buf_wt_rd_*  -> weight value entry
+sc2buf_wmb_rd_* -> compressed weight bitmap entry
+```
+
+CBUF 三个读口都在请求后固定 6 拍返回 1024 bit，无 ready/反压。CSC 根据卷积的
+`H/W/C/R/S`、stride、padding 和 kernel group 进度：
+
+- 选择当前输出位置所需的 activation 窗口；
+- 沿 C/R/S 维组织 Data 与 Weight；
+- 压缩模式下结合 WMB 消费非零 WT；
+- 将配对后的 Data/Weight 按 CMAC lane 时序送入乘法阵列；
+- 在相邻窗口间复用 CBUF 中的 activation，在不同输出通道间复用同一 Data。
+
+因此 CBUF 保存的是可重复读取的 feature/weight 数据块，不是 CDMA 提前复制好的全部
+滑窗。真正“按 CMAC 计算顺序重组”的模块是 CSC。
+
+#### 1.4.8 空间记账、归还与层完成
+
+CBUF 本身只是被动 SRAM，不知道某个 entry 是否仍被使用。CDMA 与 CSC 用增量账本
+避免覆盖尚未消费的数据：
+
+```text
+CDMA写入落地 -> cdma2sc_*_updt：增加可用entries/slices/kernels
+CSC消费完成  -> sc2cdma_*_updt：归还entries/slices/kernels
+```
+
+Data 侧 `NV_NVDLA_CDMA_status` 根据：
+
+```text
+free_entries = data_bank_count * 256 - valid_entries
+```
+
+限制 DC/IMG/WG 继续预取。Weight 侧在 `NV_NVDLA_CDMA_wt` 内分别维护 WT/WMB 的
+requested、stored、available 账本。update 经过足够流水延迟后才送 CSC，保证 CSC
+看见“可用”时数据已经真正写进 CBUF RAM。
+
+跨层是否清账取决于 reuse/bank 布局。需要清空旧账时，CSC 发 pending request，CDMA
+进入 pending 并 ack，重置旧布局下的指针和 available 计数；允许 reuse 时则保留仍可
+复用的数据。
+
+一层结束也不是某一条 DMA 收到最后一个 response 就立刻完成。Data 和 Weight 各自在
+自己的末尾写入/update 流水排空后产生对应 done 和单拍中断；整个 CDMA 层的寄存器组
+切换则必须等待两侧都完成：
+
+```text
+Data侧：当前DC/IMG/WG完成并排空写入/update流水
+Weight侧：所有kernel group满足并排空写入/update流水
+Data done -> dat done中断
+Weight done -> wt done中断
+Data done && Weight done
+    -> status切层
+    -> 清当前consumer组op_en
+    -> consumer翻转到下一乒乓寄存器组
+```
+
+#### 1.4.9 一张表记住所有格式变化
+
+| 位置 | Data 主线 | Weight 主线 |
+|---|---|---|
+| 外存 | feature/image/tile 布局 | dense WT，或软件生成的 WT/WMB/WGS |
+| DMA 请求粒度 | 32B atom | 32B atom |
+| DMA response | 512-bit data + 2-bit atom mask | 512-bit data + 2-bit atom mask |
+| 临时缓存 | shared_buffer：256-bit/entry | WT/WMB 本地 256-bit 拼接寄存器；WGS FIFO |
+| 路径整理 | DC/WG 输出512bit；IMG pack输出1024bit | WT/WMB 拼成512bit；WGS拆成32bit |
+| 数值处理 | CVT：整数减/乘/移位/饱和，或 bypass/FP16处理 | 不经CVT；FP16仅做异常检测/可选NaN清零 |
+| 写 CBUF | 1024-bit data + 2-bit half enable | 512-bit WT/WMB + 1-bit column select |
+| CBUF位置 | 动态配置的低编号 data banks | WT紧跟data区；压缩WMB固定bank15；WGS不进入 |
+| 谁按卷积顺序读取 | CSC data loader | CSC weight loader |
+
+用一句话概括整条链路：
+
+> 软件定义外存和 CBUF 格式；CDMA 负责按容量预取、做必要的数据格式/数值预处理并
+> 写入 CBUF；CBUF 负责片上保存和固定延迟读出；CSC 才负责按卷积窗口、通道、kernel
+> 和 CMAC lane 的顺序组织计算数据。
+
 ## 2. 接口信号表
 
 方向以 CDMA/CBUF 为参照。CDMA 端口声明见 vmod/nvdla/cdma/NV_NVDLA_cdma.v:113-199，
@@ -178,6 +490,15 @@ CBUF 本身无握手，空间/数据的安全性靠这组 CDMA↔CSC 的记账�
 | sc2cdma_wt_updt / kernels / entries / wmb_entries | CSC→CDMA | 1/14/12/9 | weight 侧归还 | cdma.v:192-195；wt.v:8306（归还入账样板） |
 | sc2cdma_dat_pending_req / **cdma2sc_dat_pending_ack** | in / out | 1/1 | 层间清账握手：CSC 请求暂停，CDMA 进 pending 态应答并把 valid_entries/slices/wr_idx 清零 | cdma.v:183、:129；status.v:502（ack 条件）、:554、:642（清零）、:973、:977 |
 | sc2cdma_wt_pending_req / **cdma2sc_wt_pending_ack** | in / out | 1/1 | 同上，weight 侧 | cdma.v:185、:131；wt.v:2507 |
+
+> **勘误/补注（2026-08-02，阶段 3.2 csc_cmac_cacc UT 实测发现）**：
+> **sc2cdma_wt_kernels 是归还方向的死字段**——CSC 侧硬拴 0
+> （vmod/nvdla/csc/NV_NVDLA_CSC_wl.v:3753 `assign sc2cdma_wt_kernels = 14'b0;`），
+> CDMA 侧上游自注 "sc2cdma_wt_kernels are useless"（NV_NVDLA_CDMA_wt.v:8190），
+> 归还入账只消费 entries。两侧自洽，属上游有意废弃，不是 bug；**跨单元的 weight
+> 归还账实际只靠 entries 一本**，kernels 账本仅在 cdma2sc（通告）方向有效。
+> 对 UT：cdma_sc 类 stub/refmodel 不应对 sc2cdma_wt_kernels 建立非零预期或守恒
+> 校验（对偶记录见 csc-cmac-cacc.md §5.13）。
 
 ### 2.6 中断
 
@@ -393,11 +714,27 @@ bank = 256 entry = 32KB；全阵列 **512KB**。地址恒为 {bank[3:0], entry[7
     （hsel=通道计数 bit2），entry = 8 个输入 atom = 128 个 int8 元素；
   - 取数分组粒度与之配套：`req_ch_mode` = shrink 4 / 其他 2 / packed_1x1 1
     （:5912-5914）。
-- IMG 通路的 pixel 格式重排（含 YUV/mean）另有 pack 规则，**留待 3.3 端到端对照时
-  补**（占位）。
+- IMG 通路由 `IMG_pack` 负责 packed/planar pixel 解包、YUV/RGB 分量位置整理，并生成
+  data/mean/pad mask 后送 CVT；整体边界见 1.4.3～1.4.4。具体逐格式 bit lane 规则应在
+  IMG 模块级 spec 中单独展开，不能把它理解成提前展开卷积滑窗。
 - **weight 区摆放**：wt/wgs 数据是线性字节流（压缩流或 `byte_per_kernel×kernel`
   裸流），按到达顺序填 64B 半 entry、hsel=半 entry 计数 bit0（wt.v:7390-7404），
   低半在前；wmb 流同规则填 bank15。
+
+> **补注（2026-08-02，权重流的消费面格式——阶段 3.2 UT 实测踩坑教训）**：上一条
+> "线性字节流"描述的是 **CDMA 搬运面**（bpk×K 裸流按到达序填半 entry），没有错；
+> 但这条字节流本身的**软件编排格式**（即 CSC 消费面约定）是：**外层按 64 通道一轮
+> （C 轮），轮内是 kernel-slot 的 128B beat 序列**——
+> - int16：beat j = kernel j 在本轮的 64 通道 × 2B；
+> - int8：beat j = kernel 2j 与 kernel 2j+1 各自本轮 64B 的前后半拼接；K 为奇数时
+>   末 beat 高 64B 补 0；
+> - `D_WEIGHT_BYTES` = 此流的总字节数（寄存器字段本身按 128B 粒度存放，即 >>7 值；
+>   CSC 侧直接把该值当 entry 数消费，NV_NVDLA_CSC_wl.v:1899 last_weight_entries）。
+>
+> **TB/测试直造 cbuf 权重镜像时必须按消费面格式生成**，不能按"kernel 连续裸流"的
+> 直觉排布——csc_cmac_cacc UT（Wave 2）实测按裸流直觉造数导致全错，按上述格式
+> 修正后 9/9 绿（对偶记录见 csc-cmac-cacc.md §4.3）。CDMA 整链（外存→cbuf）之所以
+> 自然满足该格式，是因为软件在外存中就按此编排（1.4.1 节"软件先准备什么"）。
 
 **复位 flush（DV 实测已证实，代码依据如下）**：复位释放后 CDMA 自动把整个 CBUF
 清零一遍，**与 D_BANK 配置无关**（flush 计数器是纯自由计数，不看任何寄存器）：

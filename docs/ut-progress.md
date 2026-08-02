@@ -10,11 +10,13 @@
 | CSB 公共链路 spec | 基本完成 | `docs/spec/common/csb-link.md` 已覆盖 APB/csb2nvdla/csb_master/fanout/reg 终点行为 |
 | DMA 客户端接口 spec | 基本完成（含两条勘误） | `docs/spec/common/dma-if.md`；阶段3.1 补：cdma 4 路无 credit 勘误（4 节）、mask 仅 2'b11/2'b01 勘误（3.2 节） |
 | 阶段 2 RTL 注释 | 完成 | apb2csb、csb_master、CDP reg/RDMA/IG/EG 关键中文注释 |
-| 阶段 3.1 RTL 注释 | 进行中 | Wave 1：cdma 顶层/regfile/status/dma_mux + cbuf 5 文件；Wave 2（进行中）：dc/wt/cvt/shared_buffer |
+| 阶段 3.1 RTL 注释 | 完成（注释线已收线） | 两批 11 文件 536 行（cdma 顶层/regfile/status/dma_mux/cbuf + dc/wt/cvt/CVT_cell/shared_buffer/wrr_arb），commit e1c62cf；此后按团队决定不再新增 RTL 注释 |
 | `csb_master` UT | 可回归 | `make regress` smoke + random x3 seeds 全绿 |
 | **cdma_cbuf UT** | 骨架完成，T0 绿 | `verif/ut/cdma_cbuf/`；T0 寄存器面冒烟已回归（复位值/mask 化写读/producer 影子/全偏移扫描/prdy 恒 1/flush_done 轮询） |
 | 单元级 spec | cdma-cbuf 草稿完成 | `docs/spec/units/cdma-cbuf.md`（接口/寄存器/机制/checklist 初版 + 7 项 refmodel 依据） |
 | DMA slave agent | 功能增强中 | 新增未初始化 pattern `default_byte()`（可复算哈希）；mask 生成收窄为 2'b11/2'b01 |
+| **csc_cmac_cacc UT（阶段 3.2）** | **回归 9/9 全绿** | `verif/ut/csc_cmac_cacc/`；T0×2/T1/T2/T3×3/T5/T6（老回归无破坏）；核销明细见 `docs/spec/units/csc-cmac-cacc.md` §3 |
+| csc+cmac+cacc 验证方案书 | 完成（三轮修订收口） | `docs/spec/units/csc-cmac-cacc.md`（新文档类型"验证方案书"，四部分结构；61 条 feature、55 个 reg2dp 字段零遗漏、51 条测试点全量状态标注） |
 
 ## 阶段 3.1 Wave 1 小结（2026-08-01）
 
@@ -61,6 +63,46 @@
 
 阶段 3.1 T0：cdma_cbuf 寄存器面冒烟绿（核销项见
 `docs/spec/units/cdma-cbuf.md` §6.1）；T1-T6 排期见同文 §6 测试映射。
+
+## 阶段 3.2 小结（2026-08-02）
+
+对象：csc + cmac×2 + cacc 卷积核心链联合 UT（7 种模块 8 实例，含 4 个数据面
+retiming）。回归 **9/9 全绿**（T0×2/T1/T2/T3×3/T5/T6），老回归无破坏。
+
+产出：
+
+- **DOC**：`docs/spec/units/csc-cmac-cacc.md` **验证方案书**（新文档类型，四部分：
+  DUT 架构与代码列表 / feature 清单 / 测试点 / 验证框架；docs/spec/README.md 已增
+  该类型约定）。61 条 feature（含覆盖/延后结论）、55 个 reg2dp 字段核对零遗漏、
+  51 条测试点全量状态标注；三轮修订吸收 DV 两波实测（beat 序定案、跨层指针合同、
+  refmodel 支持面、5 条平台经验）。附带 `cdma-cbuf.md` 两处勘误/补注
+  （wt_kernels 死字段、权重消费面格式）。
+- **DV**：`verif/ut/csc_cmac_cacc/`（gen_tb_top.py 生成 tb_top，1143 互连 wire）+
+  新组件 cbuf_resp_if/cbuf_model、csc_cdma_if/csc_cdma_stub、sdp_if/sdp_item/
+  sdp_sink_stub；refmodel（唯一判分面 cacc2sdp，CALC int8/int16 逐行翻译）。
+
+refmodel 支持面（实测定案）：DC、int8+int16、非压缩权重、feature 输入、单 batch、
+stride=1/无 pad/无 dilation、R=S=1、C 为 64 整数倍、K int16≤16/int8≤32、clip
+全域 [0,31]、累加中途不饱和（guard 位宽保证）。
+
+关键定案与发现（均已归档方案书，含 file:line）：
+
+| 定案/发现 | 归档位置 |
+|---|---|
+| cacc2sdp beat 序：光栅序逐像素；int16 1 beat/像素、int8 恒 2 beat/像素（与 K 无关）；l≥K lane 门控写 0 | csc-cmac-cacc.md §4.5 |
+| 跨层 cbuf 读指针环形前进不复位（同 bank 层）；PEND 清账层归零 | 同文 §2.3 |
+| pending 期 updt 被 sg 静默清零（激励顺序合同第一坑） | 同文 §4.4/§2.3 F-CBUF-6 |
+| **sc2cdma_wt_kernels 归还方向死字段**（CSC 拴 0 + CDMA 自注 useless，账只走 entries） | cdma-cbuf.md §2.5 勘误；同文 §5.13 |
+| 权重 cbuf 镜像须按消费面 kernel-slot beat 格式直造（裸流直觉全错，踩坑修正） | cdma-cbuf.md §4.4 补注；同文 §4.3 |
+| wl bank 溢出断言纯组合不看 op_en（D_BANK 禁写全 1） | 同文 §1.4/§2.3 F-CBUF-13 |
+| 三单元 proc_precision 复位 2'b01；cacc 中断位 toggle 交替；cacc2sdp batch_end 拴 0 | 同文 §1.4/§5 |
+| 平台：gen_tb_top 生成流程、DESIGNWARE_NOEXIST+NV_DW_* 替身、randomize-with 同名坑 | 同文 §4.6 |
+
+测试点核销统计（51 条）：**全核销 28 / 部分或间接核销 16 / 未做 7**。部分核销主因
+是 Wave 2 未挂 L1 monitor（C/D 组靠终点位精确全对分端到端背书）；未做集中在负面
+断言组。**Wave 3 待办**：挂 sc2mac/mac2accu 被动 monitor 收 C/D 组与 B2/F4/G1；
+负面组 A5/H5、H2/H3/H4/H6、H8 独立小测；F5 dbuf 深度断言；A2 全字段 mask 化补全
+（明细见方案书 §3.8 末尾汇总框）。
 
 ## RTL 学习入口
 
@@ -113,6 +155,19 @@
 4. `NV_NVDLA_CDMA_status.v`（记账/切层/中断）→ §4.5
 5. `vmod/nvdla/cbuf/NV_NVDLA_cbuf.v`（bank 阵列与断言合同）→ §4.4
 
+### 4. CSC + CMAC + CACC（阶段 3.2）
+
+按 `docs/spec/units/csc-cmac-cacc.md` 章节顺序读：
+
+1. `vmod/nvdla/csc/NV_NVDLA_csc.v`（顶层四实例）+ `NV_NVDLA_CSC_sg.v`
+   （层状态机/pending/信用/就绪门槛）→ 方案书 §1.2/§2.3
+2. `NV_NVDLA_CSC_dl.v`（dat 双路同源 + pd 生成）、`NV_NVDLA_CSC_wl.v`
+   （sel[15:0] 拆 a/b、bank 组合断言）→ §1.3 ④/§2.3
+3. `vmod/nvdla/cmac/NV_NVDLA_CMAC_core.v`（cfg/rt_in/active/mac×8/rt_out）→ §1.2
+4. `vmod/nvdla/cacc/NV_NVDLA_CACC_assembly_ctrl.v`（pd 解包/C 轮累加）、
+   `CACC_calculator.v`（192 cell）、`CACC_delivery_ctrl.v` + `delivery_buffer.v`
+   （beat 序/credit/中断）→ §2.6/§2.7/§4.5
+
 ## CSB UT 覆盖核销
 
 | `csb-link.md` 测试点 | 当前状态 | 说明 |
@@ -140,4 +195,11 @@
 3. 负面断言激励小测集（cdma-cbuf.md §6.6，+define+ASSERT_ON）。
 4. 给 `csb_fanout_responder` 加 `resp_error_pct`，补 csb error 位不可见测试。
 5. dma_slave_responder 按 mask 勘误收窄生成路径的回归（不再产生 2'b10）。
-6. 阶段 3.2 前写 `docs/spec/units/csc.md` 第一版（sc2buf 消费侧 + sc2mac）。
+6. ~~阶段 3.2 前写 `docs/spec/units/csc.md` 第一版~~ **已被 3.2 验证方案书取代
+   （2026-08-02）**：csc-cmac-cacc.md 以"验证方案书"形态覆盖三单元（含 sc2buf
+   消费侧与 sc2mac），逐单元四要素 spec 视后续需要再拆。
+7. **csc_cmac_cacc Wave 3**（明细见 csc-cmac-cacc.md §3.8 汇总框）：L1 monitor
+   收 C/D 组；负面组 A5/H5、H2/H3/H4/H6、H8；F5 深度断言；A2 全字段补全。
+8. **阶段 3.3 端到端 trace 对照**启动：conv_8x8_fc_int16、
+   googlenet_conv2_3x3_int16 过波形，与 cdma_cbuf/csc_cmac_cacc 两个 UT 的
+   refmodel 口径互证。
