@@ -70,7 +70,10 @@
 ../common/dma/dma_if.sv
 ../common/cbuf/cbuf_wr_if.sv
 ../common/cbuf/cbuf_rd_if.sv
+../common/cbuf/cbuf_resp_if.sv
 ../common/cdma_sc/cdma_sc_if.sv
+../common/cdma_sc/csc_cdma_if.sv
+../common/sdp/sdp_if.sv
 ../common/intr/intr_if.sv
 
 // ---- package ----

@@ -28,9 +28,14 @@ package nvdla_ut_pkg;
   `include "cbuf/cbuf_wr_monitor.svh"
   `include "cbuf/cbuf_rd_item.svh"
   `include "cbuf/cbuf_rd_agent.svh"
+  `include "cbuf/cbuf_model.svh"
 
   `include "cdma_sc/cdma_sc_item.svh"
   `include "cdma_sc/cdma_sc_stub.svh"
+  `include "cdma_sc/csc_cdma_stub.svh"
+
+  `include "sdp/sdp_item.svh"
+  `include "sdp/sdp_sink_stub.svh"
 
   `include "intr/intr_agent.svh"
 
