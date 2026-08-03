@@ -82,7 +82,7 @@ mul_i(op_a_dat[15:0], op_b_dat[15:0])
 
 | 模式 | 单个mul的有效计算 | 64个mul合计 |
 | --- | --- | --- |
-| int8 | 低/高两个8-bit子乘积 | 128个8b乘积 |
+| int8 | 低/高两个8-bit子乘积 | 两组各64个8b乘积 |
 | int16 | 一个16b乘积 | 64个16b乘积 |
 | fp16 | 对齐后的尾数乘积 | 64个FP16尾数乘积 |
 
@@ -93,9 +93,12 @@ mul_i(op_a_dat[15:0], op_b_dat[15:0])
 DC整数模式可以抽象为：
 
 ```text
-int8 : sum_{i=0..127}(signed(data[i]) * signed(weight[i]))
+int8-A: sum_{i=0..63}(signed(data[i])    * signed(weight[i]))
+int8-B: sum_{i=0..63}(signed(data[i+64]) * signed(weight[i+64]))
 int16: sum_{i=0..63} (signed(data[i]) * signed(weight[i]))
 ```
+
+Direct INT8 下，CSC DL 令 `data[i+64]=data[i]`，WL 在两个 weight half 中放入两个逻辑 kernel 的权重，因此上面两条和对应两个逻辑 kernel 部分和，而不是把128个不同 channel累加成一个结果。
 
 mask和非零标志在active/mul级把无效元素变为零贡献。多级 `DW02_tree/NV_DW02_tree` 将大量乘积压缩、相加，并保留足够guard位形成44-bit结果。
 
@@ -144,7 +147,7 @@ FP16检测到NaN时，NaN构造值可覆盖普通数值结果，并置 `mac_out_
 ## 10. 容易误解的点
 
 1. 一个`CORE_mac`对应一个kernel，不是整个8-kernel半阵列。
-2. 64个mul在int8下完成128个乘法，因为每个mul包含两个8-bit子结果。
+2. 64个mul在int8下完成两组各64个乘法，因为每个mul包含两个8-bit子结果；两组结果保持独立。
 3. 176-bit不是一个普通176-bit整数；它按模式分成4个44-bit结果槽。
 4. CMAC只算当前操作拍点积，不保存跨channel group历史和。
 5. FP16输出是扩展中间格式，不是直接舍入成FP16。

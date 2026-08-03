@@ -65,14 +65,14 @@ wtk_sd_exp[191:0]/mask[63:0]/pvld
 
 ### 4.1 int8
 
-每两个8-bit byte进入一个16-bit乘法单元，但保留为两组独立有符号8-bit操作数：
+两个 512-bit half 中相同位置的 byte 进入同一个16-bit乘法单元，并保留为两组独立有符号8-bit操作数：
 
 ```text
-byte[2i]   -> sub-lane A
-byte[2i+1] -> sub-lane B
+byte[i]    -> sub-lane A
+byte[i+64] -> sub-lane B
 ```
 
-因此64个乘法单元覆盖128个int8元素。
+因此64个乘法单元完成两组各64个的 INT8 乘法。Direct INT8 下，DL 会把同一组64个 activation 复制到两个 half，WL 则把两个逻辑 kernel 的权重放入两个 half，使一个物理 kernel lane 并行产生两个逻辑 kernel 的部分和。
 
 ### 4.2 int16
 

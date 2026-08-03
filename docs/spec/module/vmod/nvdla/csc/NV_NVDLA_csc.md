@@ -354,7 +354,7 @@ flowchart TD
 - **卷积 padding**：使用寄存器配置的 `pad_value` 参与计算；
 - **内部 dummy**：只是为了保持硬件循环或阵列对齐，数据可为任意占位值，但对应 mask 必须清零。
 
-mask 才决定 lane 是否参与 CMAC 运算，不能只根据输出 data 是否为零判断有效性。INT8 下 128 个 byte lane 可表示 128 个独立元素；INT16/FP16 下相邻两个 byte lane 组成一个 16-bit 元素，DL 与后续 CMAC 会按这种配对关系解释 mask。
+mask 才决定 lane 是否参与 CMAC 运算，不能只根据输出 data 是否为零判断有效性。Direct INT8 下，DL 把64个 activation复制到上下两个64-byte half，供物理 MAC lane 对两组 kernel权重并行计算；INT16/FP16 下相邻两个 byte 组成一个16-bit元素。
 
 ### 5.5 Direct feature、image/pixel 与 Winograd 分支
 

@@ -129,13 +129,13 @@ CMAC_A/B 收到相同 activation，但 CSC 用不同 weight select 把 kernel �
 
 外部始终是128个8-bit lane，内部64个16-bit乘法单元：
 
-| 精度 | 每个 `MAC_mul` | 每个 kernel lane 的元素吞吐 |
+| 精度 | 每个 `MAC_mul` | 每个物理 kernel lane 的吞吐 |
 | --- | --- | --- |
-| int8 | 两组8b×8b | 128个 int8 元素 |
+| int8 | 两组8b×8b | 两个逻辑 kernel × 每个64个元素 |
 | int16 | 一组16b×16b | 64个 int16 元素 |
 | fp16 | 尾数乘法 + 指数对齐 | 64个 fp16 元素 |
 
-mask 会随精度配对：int16/fp16 使用相邻两个 byte lane 组成一个元素；int8 保持两个独立元素。
+INT16/FP16 使用相邻两个 byte 组成一个16-bit元素。Direct INT8 使用上下两个64-byte half：DL复制同一组64个 activation，WL分别放入两个逻辑 kernel的权重，一个物理 lane并行产生两组部分和。
 
 ## 6. 数据通路
 
@@ -201,7 +201,7 @@ CSC→CMAC 和 CMAC→CACC 均无 ready。CMAC 内部也没有事务 FIFO：
 
 1. 一个 `NV_NVDLA_cmac` 只有8个 kernel lane，完整卷积核心有A/B两份。
 2. A/B不是两个不同 RTL模块，模块数据端口也不带A/B后缀。
-3. 128个输入 byte 不等于始终有128个数；int16/fp16下每两个 byte 组成一个数。
+3. 128个输入 byte 不等于始终有128个不同输入：Direct INT8会复制64个activation，INT16/FP16则每两个byte组成一个数。
 4. `sc2mac_wt_sel` 选择 kernel lane，`sc2mac_*_mask` 选择点积元素。
 5. `mac2accu_mask` 是8个结果 lane 的有效位，不是输入元素 mask。
 6. CMAC不跨 C 轮累加；历史部分和保存在 CACC。
