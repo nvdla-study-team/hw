@@ -9,7 +9,7 @@ verif/ut/ 单元验证（Unit Test, UT）共同消费。**所有论断以 vmod/ 
 | 子目录 | 内容 | 时机 |
 |---|---|---|
 | `common/` | 跨模块公共协议：多个单元共享的总线/握手/打包约定，一份协议一篇 | 阶段2 起 |
-| `units/` | 每个功能单元一份 `<unit>.md`（如 `sdp.md`、`cdp.md`），描述该单元的对外接口、寄存器组、内部数据通路要点 | 阶段3 起（现为 `.gitkeep` 占位） |
+| `units/` | 每个功能单元一份 `<unit>.md`（如 `sdp.md`、`cdp.md`），描述该单元的对外接口、寄存器组、内部数据通路要点 | 阶段3 起 |
 
 当前已有：
 
@@ -17,6 +17,11 @@ verif/ut/ 单元验证（Unit Test, UT）共同消费。**所有论断以 vmod/ 
 |---|---|
 | [common/csb-link.md](common/csb-link.md) | CSB（Configuration Space Bus）链路：外部 APB → apb2csb → csb2nvdla 单口 → csb_master（CDC + 译码）→ 17 路 csb2xx → 单元内 reg 终点 |
 | [common/dma-if.md](common/dma-if.md) | xx2mcif / xx2cvif DMA 客户端协议：读/写请求、latency FIFO 信用（credit）、双目的地选路 |
+| [units/cdma-cbuf.md](units/cdma-cbuf.md) | cdma+cbuf 单元 spec（四要素，阶段3.1） |
+| [units/csc-cmac-cacc.md](units/csc-cmac-cacc.md) | csc+cmac+cacc 验证方案书（阶段3.2，定稿） |
+| [units/sdp.md](units/sdp.md) | sdp 验证方案书（阶段4，环境搭建阶段版） |
+| [units/pdp.md](units/pdp.md) | pdp 验证方案书（阶段4，环境搭建阶段版） |
+| [units/cdp.md](units/cdp.md) | cdp 验证方案书（阶段4，环境搭建阶段版） |
 
 单元 spec 与公共协议 spec 的分界：**凡是两个以上单元以相同形状出现的接口，写进 common/，
 units/ 里只引用不复述**（例如各引擎的 csb2xx 口、xx2mcif 口都指向 common/ 两篇）。

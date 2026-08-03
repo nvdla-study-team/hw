@@ -24,16 +24,31 @@ verif/ut/
 │   │   ├── csb_seq_item.svh       一套 item 两面共用
 │   │   ├── csb_master_{driver,monitor,agent}.svh
 │   │   └── csb_fanout_{cfg,responder,monitor,agent}.svh   1 个类 × 17 实例
-│   ├── dma/                   dma_if + dma_slave_{responder,monitor,agent}（参数化，阶段2 骨架）
-│   └── intr/                  intr_if + intr_agent（monitor-only 骨架）
-└── csb_master/                第一个 UT：NV_NVDLA_csb_master
-    ├── Makefile / filelist.f
-    ├── csb_master_ut_pkg.sv
-    ├── tb/tb_top.sv           双时钟 10ns/7ns、17 路端口↔if 宏批量连接
-    ├── env/csb_master_{env,scoreboard}.svh
-    ├── seqs/csb_{base,smoke,dummy,random}_seq.svh
-    └── tests/csb_master_test_lib.svh   base / smoke / random
+│   ├── dma/                   dma_if + dma_slave_{responder,monitor,agent}（参数化）
+│   ├── cbuf/                  cbuf 写监测 + sc2buf 读口 agent + cbuf_model（阶段3.1）
+│   ├── cdma_sc/               cdma<->csc 状态/信用面 stub 两方向（阶段3.1/3.2）
+│   ├── sdp/                   cacc2sdp 协议（历史命名）：sdp_if（drv_cb=sink、src_cb=源，
+│   │                          阶段4 增）+ sdp_item + sdp_sink_stub + sdp_source_stub（阶段4 增）
+│   ├── sdp2pdp/               sdp→pdp 链路 256b 流（阶段4 新增）：
+│   │                          sdp2pdp_{if,item,sink_stub,source_stub}
+│   └── intr/                  intr_if + intr_agent（monitor-only）
+├── csb_master/                UT#1（阶段2）：NV_NVDLA_csb_master
+│   ├── Makefile / filelist.f / csb_master_ut_pkg.sv
+│   ├── tb/tb_top.sv           双时钟 10ns/7ns、17 路端口↔if 宏批量连接
+│   ├── env/csb_master_{env,scoreboard}.svh
+│   ├── seqs/csb_{base,smoke,dummy,random}_seq.svh
+│   └── tests/csb_master_test_lib.svh   base / smoke / random
+├── cdma_cbuf/                 UT#2（阶段3.1）：cdma+cbuf，refmodel/layer_cfg 三件套
+├── csc_cmac_cacc/             UT#3（阶段3.2）：csc+cmac×2+cacc，tb 由 tb/gen_tb_top.py 生成
+├── sdp/                       UT#4（阶段4）：NV_NVDLA_sdp，4 读 DMA + cacc2sdp/sdp2pdp 直连
+├── pdp/                       UT#5（阶段4）：NV_NVDLA_pdp，1 读 1 写 + sdp2pdp 源
+└── cdp/                       UT#6（阶段4）：NV_NVDLA_cdp，1 读 1 写、无直连
 ```
+
+阶段4 三 UT（sdp/pdp/cdp）当前为**环境+T0 寄存器面冒烟**（`make regress` = T0 ×
+seed1/2），测试点分解与数据通路见 `docs/spec/units/{sdp,pdp,cdp}.md` 验证方案书。
+注意 `common/sdp/` 指 **cacc2sdp 协议**（历史命名），`common/sdp2pdp/` 才是
+sdp→pdp 链路——勿混。
 
 ## 平台结构（csb_master UT）
 

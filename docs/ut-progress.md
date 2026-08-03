@@ -17,6 +17,10 @@
 | DMA slave agent | 功能增强中 | 新增未初始化 pattern `default_byte()`（可复算哈希）；mask 生成收窄为 2'b11/2'b01 |
 | **csc_cmac_cacc UT（阶段 3.2）** | **回归 9/9 全绿** | `verif/ut/csc_cmac_cacc/`；T0×2/T1/T2/T3×3/T5/T6（老回归无破坏）；核销明细见 `docs/spec/units/csc-cmac-cacc.md` §3 |
 | csc+cmac+cacc 验证方案书 | 完成（三轮修订收口） | `docs/spec/units/csc-cmac-cacc.md`（新文档类型"验证方案书"，四部分结构；61 条 feature、55 个 reg2dp 字段零遗漏、51 条测试点全量状态标注） |
+| **sdp UT（阶段 4）** | 环境 + T0 冒烟绿 | `verif/ut/sdp/`；`make regress` T0×2 seed 全绿；4 读 DMA + cacc2sdp/sdp2pdp 双直连挂接 |
+| **pdp UT（阶段 4）** | 环境 + T0 冒烟绿 | `verif/ut/pdp/`；`make regress` T0×2 seed 全绿；sdp2pdp 源 stub 挂接 |
+| **cdp UT（阶段 4）** | 环境 + T0 冒烟绿 | `verif/ut/cdp/`；`make regress` T0×2 seed 全绿；纯内存到内存，无直连 |
+| sdp/pdp/cdp 验证方案书 | 环境搭建阶段版（§1/§4 实、§2 骨架、§3 仅 T0） | `docs/spec/units/{sdp,pdp,cdp}.md`；reg2dp 总表三份均全字段列出（映射待定） |
 
 ## 阶段 3.1 Wave 1 小结（2026-08-01）
 
@@ -103,6 +107,37 @@ stride=1/无 pad/无 dilation、R=S=1、C 为 64 整数倍、K int16≤16/int8�
 断言组。**Wave 3 待办**：挂 sc2mac/mac2accu 被动 monitor 收 C/D 组与 B2/F4/G1；
 负面组 A5/H5、H2/H3/H4/H6、H8 独立小测；F5 dbuf 深度断言；A2 全字段 mask 化补全
 （明细见方案书 §3.8 末尾汇总框）。
+
+## 阶段 4 小结（2026-08-03）
+
+对象：sdp / pdp / cdp 三个后处理引擎的 UT 环境（并行三线搭建，只搭环境+基础
+base+T0 寄存器面冒烟，测试点分解留待后续 Wave）。**阶段 3.3（端到端 trace 对照）
+按团队决定跳过，直接进阶段 4。**
+
+产出：
+
+- **公共层（先行冻结）**：`common/sdp/sdp_if.sv` 增 `src_cb`（TB 可扮 cacc 源）+
+  `sdp_source_stub`；新 `common/sdp2pdp/`（if/item/sink_stub/source_stub 四件，
+  sdp、pdp 两 UT 共用）。落地后三老 UT build + csb_master regress + ccc T0 复验无破坏。
+- **DV×3**：`verif/ut/{sdp,pdp,cdp}/` 三套自包含 UT（Makefile/filelist/tb_top 手写/
+  env/骨架 scoreboard/base+T0 seq/test lib），`make regress`（T0 × seed1/2）三路全绿，
+  老回归复跑无破坏（6 UT 抽查全绿）。
+- **DOC×3**：`docs/spec/units/{sdp,pdp,cdp}.md` 验证方案书（环境搭建阶段版）：
+  §1 DUT 架构/端口/寄存器地址图全实，§2 feature 骨架 + reg2dp 全字段总表
+  （sdp 两块约 140、pdp 67、cdp 61 字段，映射列待定），§3 仅 T0 已核销，
+  §4 TB 结构/组件表/BFM 规格/平台注记全实。
+
+本轮实测发现（均已归档方案书，含 file:line）：
+
+| 发现 | 归档位置 |
+|---|---|
+| SDP 主块 0x00c（S_LUT_ACCESS_DATA）读触发 LUT 指针自增——T0 扫描跳过 | sdp.md §4.6 |
+| CDP 同类：lut_access_type 复位即 READ，读 0x00c 自增；S/D 分界 0x048 | cdp.md §4.6/§5 |
+| **PDP_RDMA D_POOLING_KERNEL_CFG 写非法 kw/ksw 组合当拍触发溢出断言**（组合逻辑无 op_en 门控，同 ccc D_BANK 一类设计合同）；主块同名断言因只接 kw[2:0] 数学上永不触发 | pdp.md §5.1 |
+| RDMA 块与主块同名寄存器字段位置/复位值可不同（SDP FEATURE_MODE_CFG、PDP KERNEL_CFG） | sdp.md §1.4 / pdp.md §1.4 |
+| sdp/pdp/cdp 生成源零 DW 引用——filelist 无需 DESIGNWARE_NOEXIST/NV_DW 替身（与 ccc 不同） | 三方案书 §4.6 |
+| ram_type 复位=CV：数据通路 wave 必须显式编程 src/dst_ram_type=1 选 MC，否则全走被 tie 死的 CVIF | 三方案书 §4.6 |
+| VCS 对 interface 裸 logic + 双向 clocking 报多驱动 warning（声明未来升 error）——届时需给 sdp_if/sdp2pdp_if 拆方向或加 modport（common 改动，备案待裁决） | sdp.md/pdp.md §4.6 |
 
 ## RTL 学习入口
 
@@ -200,6 +235,11 @@ stride=1/无 pad/无 dilation、R=S=1、C 为 64 整数倍、K int16≤16/int8�
    消费侧与 sc2mac），逐单元四要素 spec 视后续需要再拆。
 7. **csc_cmac_cacc Wave 3**（明细见 csc-cmac-cacc.md §3.8 汇总框）：L1 monitor
    收 C/D 组；负面组 A5/H5、H2/H3/H4/H6、H8；F5 深度断言；A2 全字段补全。
-8. **阶段 3.3 端到端 trace 对照**启动：conv_8x8_fc_int16、
-   googlenet_conv2_3x3_int16 过波形，与 cdma_cbuf/csc_cmac_cacc 两个 UT 的
-   refmodel 口径互证。
+8. ~~阶段 3.3 端到端 trace 对照~~ **按团队决定跳过（2026-08-03），直接进阶段 4**；
+   如后续需要可重启（conv_8x8_fc_int16、googlenet_conv2_3x3_int16 与两 UT
+   refmodel 口径互证）。
+9. **sdp/pdp/cdp 测试点分解与数据通路 Wave**：三份方案书 §2 覆盖列定案 + §3
+   测试点展开；refmodel/layer_cfg 三件套落地；数据通路首测记得显式编程
+   ram_type=MC（见各方案书 §4.6 坑位记录）。
+10. sdp_if/sdp2pdp_if 双向 clocking 的 VCS 多驱动 warning 备案：若 VCS 升级为
+    error，拆 modport/独立 clocking（common 改动，动前跑全量 UT 回归）。
