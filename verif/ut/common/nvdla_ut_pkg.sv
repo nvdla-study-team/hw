@@ -36,6 +36,11 @@ package nvdla_ut_pkg;
 
   `include "sdp/sdp_item.svh"
   `include "sdp/sdp_sink_stub.svh"
+  `include "sdp/sdp_source_stub.svh"
+
+  `include "sdp2pdp/sdp2pdp_item.svh"
+  `include "sdp2pdp/sdp2pdp_sink_stub.svh"
+  `include "sdp2pdp/sdp2pdp_source_stub.svh"
 
   `include "intr/intr_agent.svh"
 

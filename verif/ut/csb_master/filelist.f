@@ -48,6 +48,7 @@
 ../common/cdma_sc/cdma_sc_if.sv
 ../common/cdma_sc/csc_cdma_if.sv
 ../common/sdp/sdp_if.sv
+../common/sdp2pdp/sdp2pdp_if.sv
 ../common/intr/intr_if.sv
 
 // ---- package ----
